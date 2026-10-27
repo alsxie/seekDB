@@ -356,6 +356,7 @@ OBLIB_UNITY_GROUPS = {
             name = "oblib_lib_ob_vector_util_0",
             language = "c++",
             srcs = [
+                "src/oblib/lib/vector/ob_hipvs_builder.cpp",
                 "src/oblib/lib/vector/ob_vector_util.cpp",
                 "src/oblib/lib/vector/ob_vsag_adaptor.cpp",
             ],

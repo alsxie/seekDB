@@ -680,6 +680,8 @@ cc_library(
 cc_library(
     name = "oblib_vector",
     hdrs = [
+        "lib/vector/ob_hipvs_builder.h",
+        "lib/vector/ob_hipvs_plugin_abi.h",
         "lib/vector/ob_vector_util.h",
         "lib/vector/ob_vsag_adaptor.h",
     ],
@@ -691,6 +693,22 @@ cc_library(
     features = ["layering_check"],
     tags = ["manual"],
     visibility = _OBLIB_INTERFACE_VISIBILITY,
+)
+
+cc_library(
+    name = "hipvs_builder_test_support",
+    testonly = True,
+    srcs = ["lib/vector/ob_hipvs_builder.cpp"],
+    hdrs = [
+        "lib/vector/ob_hipvs_builder.h",
+        "lib/vector/ob_hipvs_plugin_abi.h",
+    ],
+    includes = ["."],
+    linkopts = select({
+        "@platforms//os:linux": ["-ldl"],
+        "//conditions:default": [],
+    }),
+    visibility = ["//unittest/oblib:__pkg__"],
 )
 
 _OBLIB_PRIVATE_HEADERS = [
