@@ -1,0 +1,60 @@
+# unknown table functions and options are rejected
+# malformed data fails cleanly
+# header = false exposes the header line as data
+column0	column1
+1	Alice
+2	Bob
+# projection, filters, ordering and expressions
+name	s2
+Alice	197
+Chen	180.5
+column_name	column_type	null	key	default	extra
+id	BIGINT	NO	NULL	NULL	NULL
+s2	DOUBLE	YES	NULL	NULL	NULL
+n	VARCHAR	YES	NULL	NULL	NULL
+# joins between file tables and with ordinary tables (rescan of the inner side)
+id	name	note
+1	Alice	NULL
+2	Bob	NULL
+3	Chen	ok
+id	tag	name
+1	one	Alice
+3	three	Chen
+4	four	NULL
+id	cnt
+1	1
+3	3
+4	3
+# INSERT ... SELECT and views over file tables
+id	tag
+1	one
+3	three
+4	four
+11	Alice
+12	Bob
+13	Chen
+id	name
+1	Alice
+2	Bob
+3	Chen
+# COPY round trip of quotes, delimiters, newlines, empty strings and NULL
+id	s	is_null	len
+1	a,b	0	3
+2	say "hi"	0	8
+3	x<NL>y	0	3
+4		0	0
+5	NULL	1	NULL
+# COPY with custom delimiter and quote, read back with the same options
+id	tag
+1	one
+3	three
+4	four
+11	Alice
+12	Bob
+13	Chen
+# COPY never overwrites and rejects unsupported formats
+# a failed COPY leaves no file behind
+file
+edge1.csv
+edge2.csv
+# disabling the switch blocks every entry point

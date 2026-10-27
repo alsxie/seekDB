@@ -19,7 +19,7 @@ AI_FUNC_TESTS = [
     alwayslink = True,
     deps = [
         "//bazel/third_party:gtest",
-        "//src/sql:ai_func_test_headers",
+        "//src/sql:sql_unittest_headers",
     ],
 ) for name in AI_FUNC_TESTS]
 

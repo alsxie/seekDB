@@ -23,6 +23,7 @@
 #include "lib/charset/ob_charset.h"
 #include "sql/optimizer/ob_log_plan.h"
 #include "sql/monitor/ob_sql_plan.h"
+#include "sql/engine/basic/file_sql/file_scanner.h"
 namespace oceanbase
 {
 using namespace common;
@@ -317,6 +318,21 @@ int ObDMLStmtPrinter::print_table(const TableItem *table_item,
           OZ (print_json_table(table_item));
           DATA_PRINTF(")");
           DATA_PRINTF(" %.*s", LEN_AND_PTR(table_item->alias_name_));
+          break;
+        }
+        case MulModeTableType::OB_FILE_TABLE_TYPE : {
+          file_sql::FileScanDesc desc;
+          if (table_item->json_table_def_->namespace_arr_.empty()) {
+            ret = OB_ERR_UNEXPECTED;
+          } else if (OB_FAIL(desc.deserialize(table_item->json_table_def_->namespace_arr_.at(0)))) {
+            LOG_WARN("failed to deserialize file scan desc", K(ret));
+          } else {
+            DATA_PRINTF("%.*s(", LEN_AND_PTR(desc.func_name_));
+            OZ (expr_printer_.do_print(table_item->json_table_def_->doc_exprs_.at(0), T_FROM_SCOPE));
+            OZ (file_sql::print_table_function_options(desc, buf_, buf_len_, *pos_));
+            DATA_PRINTF(") ");
+            PRINT_IDENT_WITH_QUOT(table_item->alias_name_);
+          }
           break;
         }
         case MulModeTableType::OB_UNNEST_TABLE_TYPE : {

@@ -205,13 +205,17 @@ cc_library(
     visibility = ["//src/sql:__subpackages__"],
 )
 
-# Test-only seam for AI function protocol unit tests.
+# Test-only seam for SQL unit tests (AI functions, file tables, parser).
 cc_library(
-    name = "ai_func_test_headers",
+    name = "sql_unittest_headers",
     testonly = True,
     deps = [":sql_runtime_internal_headers"] + SQL_RUNTIME_NATIVE_DEPS,
     tags = ["manual"],
-    visibility = ["//unittest/sql/engine/expr:__pkg__"],
+    visibility = [
+        "//unittest/sql/engine/basic:__pkg__",
+        "//unittest/sql/engine/expr:__pkg__",
+        "//unittest/sql/parser:__pkg__",
+    ],
 )
 
 _SQL_RUNTIME_UNITY_GROUPS = groups_without(

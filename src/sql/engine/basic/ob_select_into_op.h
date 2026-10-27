@@ -23,6 +23,7 @@
 #include "sql/engine/basic/ob_select_into_basic.h"
 #include "sql/engine/basic/ob_external_file_writer.h"
 #include "sql/resolver/dml/ob_select_stmt.h"
+#include "sql/engine/basic/file_sql/file_copy_writer.h"
 
 namespace oceanbase
 {
@@ -71,7 +72,8 @@ public:
       parallel_(1),
       buffer_size_(DEFAULT_BUFFER_SIZE),
       is_overwrite_(false),
-      external_properties_(alloc)
+      external_properties_(alloc),
+      copy_options_(alloc)
   {
   }
 
@@ -91,6 +93,7 @@ public:
   int64_t buffer_size_;
   bool is_overwrite_;
   ObExternalFileFormat::StringData external_properties_;
+  ObExternalFileFormat::StringData copy_options_;  // serialized file_sql::CopyDesc for COPY ... TO
   static const int64_t DEFAULT_MAX_FILE_SIZE = 256LL * 1024 * 1024;
   static const int64_t DEFAULT_BUFFER_SIZE = 1LL * 1024 * 1024;
 };
@@ -126,7 +129,13 @@ public:
       external_properties_(),
       format_type_(ObExternalFileFormat::FormatType::CSV_FORMAT),
       block_id_(0),
-      need_commit_(true)
+      need_commit_(true),
+      copy_desc_(),
+      copy_writer_(),
+      copy_row_alloc_("FileSqlCopyRow"),
+      copy_print_buf_(NULL),
+      copy_print_buf_len_(0),
+      copy_done_(false)
   {
   }
 
@@ -195,6 +204,13 @@ public:
   virtual void destroy() override;
 
 private:
+  // COPY ... TO: writes the child rows through file_sql::CopyCsvWriter.
+  bool is_copy() const { return !MY_SPEC_COPY_OPTIONS().empty(); }
+  const common::ObString &MY_SPEC_COPY_OPTIONS() const;
+  int open_copy();
+  int copy_all_rows(const bool is_batch, const int64_t max_row_cnt, int64_t &row_count);
+  int write_copy_row();
+  int print_copy_value(const ObObj &obj, common::ObString &text);
   int init_env_common();
   int init_csv_env();
   void set_csv_format_options();
@@ -292,6 +308,12 @@ private:
   ObExternalFileFormat::FormatType format_type_;
   uint32_t block_id_;
   bool need_commit_;
+  file_sql::CopyDesc copy_desc_;
+  file_sql::CopyCsvWriter copy_writer_;
+  common::ObArenaAllocator copy_row_alloc_;
+  char *copy_print_buf_;
+  int64_t copy_print_buf_len_;
+  bool copy_done_;
   static const int64_t SHARED_BUFFER_SIZE = 2LL * 1024 * 1024;
 
 };

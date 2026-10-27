@@ -301,6 +301,10 @@ bool ObSqlParameterization::is_tree_not_param(const ParseNode *tree)
     ret_bool = is_vec_idx_query ? false : true;
   } else if (T_HINT_OPTION_LIST == tree->type_) {
     ret_bool = true;
+  } else if (T_FILE_TABLE_EXPRESSION == tree->type_ || T_FILE_TABLE_OPTION_LIST == tree->type_
+             || (T_INTO_OUTFILE == tree->type_ && 6 == tree->num_child_)) {
+    // file paths and options of read_csv / read_json / read_parquet / glob / COPY shape the plan
+    ret_bool = true;
   } else if (T_COLLATION == tree->type_) {
     ret_bool = true;
   } else if (T_CAST_ARGUMENT == tree->type_) {

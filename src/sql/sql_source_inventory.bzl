@@ -191,6 +191,18 @@ SQL_UNITY_GROUPS = [
         ],
     ),
     struct(
+        name = "ob_sql_engine_file_sql_0",
+        language = "c++",
+        srcs = [
+            "src/sql/engine/basic/file_sql/file_sql_common.cpp",
+            "src/sql/engine/basic/file_sql/file_text_reader.cpp",
+            "src/sql/engine/basic/file_sql/file_scanner.cpp",
+            "src/sql/engine/basic/file_sql/parquet_reader.cpp",
+            "src/sql/engine/basic/file_sql/file_table_executor.cpp",
+            "src/sql/engine/basic/file_sql/file_copy_writer.cpp",
+        ],
+    ),
+    struct(
         name = "ob_sql_engine_basic_0",
         language = "c++",
         srcs = [
@@ -1414,6 +1426,7 @@ SQL_UNITY_GROUPS = [
             "src/sql/resolver/dml/ob_insert_stmt.cpp",
             "src/sql/resolver/dml/ob_raw_expr_sets.cpp",
             "src/sql/resolver/dml/ob_select_resolver.cpp",
+            "src/sql/resolver/dml/file_describe_resolver.cpp",
             "src/sql/resolver/dml/ob_select_stmt.cpp",
             "src/sql/resolver/dml/ob_sql_hint.cpp",
             "src/sql/resolver/dml/ob_stmt_expr_visitor.cpp",
