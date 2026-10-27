@@ -148,6 +148,31 @@ int ObDDLOperator::write_ai_column_meta(ObISQLClient &trans,
   return ret;
 }
 
+int ObDDLOperator::prune_ai_column_meta(ObISQLClient &trans, const ObTableSchema &table)
+{
+  int ret = OB_SUCCESS;
+  ObSqlString kept_ids;
+  for (ObTableSchema::const_column_iterator it = table.column_begin();
+       OB_SUCC(ret) && it != table.column_end(); ++it) {
+    if (OB_NOT_NULL(*it) && (*it)->is_ai_result_column()
+        && OB_FAIL(kept_ids.append_fmt(",%lu", (*it)->get_column_id()))) {
+    }
+  }
+  const char *tables[] = { "__all_ai_column", "__all_ai_column_task" };
+  for (int64_t i = 0; OB_SUCC(ret) && i < 2; ++i) {
+    ObSqlString sql;
+    int64_t affected_rows = 0;
+    // the leading 0 keeps the IN list valid when no AI column is left
+    if (OB_FAIL(sql.append_fmt("DELETE FROM %s.%s WHERE table_id = %lu AND column_id NOT IN (0%s)",
+                               OB_SYS_DATABASE_NAME, tables[i], table.get_table_id(),
+                               kept_ids.ptr()))) {
+    } else if (OB_FAIL(trans.write(sql.ptr(), affected_rows))) {
+      LOG_WARN("fail to prune ai column rows", K(ret), K(sql));
+    }
+  }
+  return ret;
+}
+
 ObDDLOperator::~ObDDLOperator()
 {
 }

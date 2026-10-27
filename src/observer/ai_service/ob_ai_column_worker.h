@@ -54,6 +54,8 @@ public:
   static const int64_t MAX_BACKOFF_US = 60 * 1000 * 1000;
   static const int64_t CLAIM_BATCH = 32;
   static const int64_t GC_INTERVAL_US = 10 * 1000 * 1000;
+  // request groups are spread over the threads by request id, so a group has a single owner
+  static const int64_t THREAD_COUNT = 4;
   static int64_t calc_backoff_us(const int64_t retry_count);
 
 private:
@@ -82,9 +84,11 @@ private:
     int64_t max_retries_;
   };
 
-  ObAiColumnWorker() : last_gc_ts_(0) {}
-  int run_once();
-  int fetch_tasks(common::ObIAllocator &allocator, common::ObIArray<Task> &tasks);
+  ObAiColumnWorker() : last_gc_ts_(0), recovered_(false) {}
+  int run_once(const int64_t thread_idx);
+  int recover_leases();
+  int fetch_tasks(common::ObIAllocator &allocator, const int64_t thread_idx,
+                  common::ObIArray<Task> &tasks);
   int claim(const Task &task, bool &claimed);
   int process(common::ObIAllocator &allocator, const Task &task);
   int get_column_info(common::ObISQLClient &client, common::ObIAllocator &allocator,
@@ -100,7 +104,8 @@ private:
                   const int64_t request_id);
   int gc();
 
-  int64_t last_gc_ts_;
+  int64_t last_gc_ts_;    // owned by thread 0
+  volatile bool recovered_;
 };
 
 }  // namespace observer

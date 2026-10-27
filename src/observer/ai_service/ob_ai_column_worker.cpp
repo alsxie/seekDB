@@ -123,7 +123,7 @@ int64_t ObAiColumnWorker::calc_backoff_us(const int64_t retry_count)
 int ObAiColumnWorker::start_worker()
 {
   int ret = OB_SUCCESS;
-  set_thread_count(1);
+  set_thread_count(THREAD_COUNT);
   if (OB_FAIL(start())) {
     LOG_WARN("fail to start ai column worker", K(ret));
   } else {
@@ -141,13 +141,25 @@ void ObAiColumnWorker::stop_worker()
 void ObAiColumnWorker::run1()
 {
   lib::set_thread_name("AiColumnWorker");
+  const int64_t thread_idx = static_cast<int64_t>(get_thread_idx());
   while (!has_set_stop()) {
-    if (SS_SERVING == GCTX.status_ && OB_NOT_NULL(GCTX.sql_proxy_)) {
-      int tmp_ret = run_once();
+    if (SS_SERVING != GCTX.status_ || OB_ISNULL(GCTX.sql_proxy_)) {
+    } else if (!recovered_) {
+      // tasks leased before a restart belong to nobody: thread 0 releases them first
+      if (0 == thread_idx) {
+        int tmp_ret = recover_leases();
+        if (OB_SUCCESS != tmp_ret) {
+          LOG_WARN_RET(tmp_ret, "fail to recover ai column task leases");
+        } else {
+          recovered_ = true;
+        }
+      }
+    } else {
+      int tmp_ret = run_once(thread_idx);
       if (OB_SUCCESS != tmp_ret) {
         LOG_WARN_RET(tmp_ret, "ai column worker round failed");
       }
-      if (ObTimeUtility::current_time() - last_gc_ts_ > GC_INTERVAL_US) {
+      if (0 == thread_idx && ObTimeUtility::current_time() - last_gc_ts_ > GC_INTERVAL_US) {
         last_gc_ts_ = ObTimeUtility::current_time();
         if (OB_SUCCESS != (tmp_ret = gc())) {
           LOG_WARN_RET(tmp_ret, "ai column metadata gc failed");
@@ -158,12 +170,28 @@ void ObAiColumnWorker::run1()
   }
 }
 
-int ObAiColumnWorker::run_once()
+int ObAiColumnWorker::recover_leases()
+{
+  int ret = OB_SUCCESS;
+  ObSqlString sql;
+  int64_t affected_rows = 0;
+  if (OB_FAIL(sql.append_fmt("UPDATE %s.%s SET state = %d WHERE state = %d",
+                             OB_SYS_DATABASE_NAME, TASK_TABLE, AI_TASK_STATE_PENDING,
+                             AI_TASK_STATE_RUNNING))) {
+  } else if (OB_FAIL(GCTX.sql_proxy_->write(sql.ptr(), affected_rows))) {
+    LOG_WARN("fail to release ai column task leases", K(ret));
+  } else {
+    LOG_INFO("released ai column task leases", K(affected_rows));
+  }
+  return ret;
+}
+
+int ObAiColumnWorker::run_once(const int64_t thread_idx)
 {
   int ret = OB_SUCCESS;
   ObArenaAllocator allocator("AiColWorker");
   ObSEArray<Task, CLAIM_BATCH> tasks;
-  if (OB_FAIL(fetch_tasks(allocator, tasks))) {
+  if (OB_FAIL(fetch_tasks(allocator, thread_idx, tasks))) {
   }
   for (int64_t i = 0; OB_SUCC(ret) && !has_set_stop() && i < tasks.count(); ++i) {
     bool claimed = false;
@@ -177,20 +205,22 @@ int ObAiColumnWorker::run_once()
   return ret;
 }
 
-int ObAiColumnWorker::fetch_tasks(ObIAllocator &allocator, ObIArray<Task> &tasks)
+int ObAiColumnWorker::fetch_tasks(ObIAllocator &allocator, const int64_t thread_idx,
+                                  ObIArray<Task> &tasks)
 {
   int ret = OB_SUCCESS;
   ObSqlString sql;
   if (OB_FAIL(sql.append_fmt("SELECT table_id, request_id, column_id, state, retry_count, "
                              "rowkey_predicate FROM %s.%s "
-                             "WHERE (state IN (%d, %d) AND eligible_ts <= now(6)) "
+                             "WHERE ((state IN (%d, %d) AND eligible_ts <= now(6)) "
                              "OR (state = %d AND lease_expire_ts < now(6)) "
-                             "OR state IN (%d, %d) "
+                             "OR state IN (%d, %d)) AND MOD(request_id, %ld) = %ld "
                              "ORDER BY eligible_ts LIMIT %ld",
                              OB_SYS_DATABASE_NAME, TASK_TABLE,
                              AI_TASK_STATE_PENDING, AI_TASK_STATE_RETRY_WAIT,
                              AI_TASK_STATE_RUNNING,
-                             AI_TASK_STATE_SUCCEEDED, AI_TASK_STATE_FAILED, CLAIM_BATCH))) {
+                             AI_TASK_STATE_SUCCEEDED, AI_TASK_STATE_FAILED,
+                             get_thread_count(), thread_idx, CLAIM_BATCH))) {
   } else {
     SMART_VAR(ObMySQLProxy::MySQLResult, res) {
       ObMySQLResult *result = NULL;

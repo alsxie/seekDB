@@ -541,6 +541,10 @@ public:
   static int write_ai_column_meta(common::ObISQLClient &trans,
                                   const share::schema::ObTableSchema &table,
                                   const common::ObIArray<share::AiColumnDef> &defs);
+  // Removes metadata and tasks of AI columns that `table` no longer has, inside the DDL
+  // transaction, so DML never sees a definition of a dropped AI column.
+  static int prune_ai_column_meta(common::ObISQLClient &trans,
+                                  const share::schema::ObTableSchema &table);
   static int drop_obj_privs(const uint64_t obj_id,
                             const uint64_t obj_ypte,
                             common::ObMySQLTransaction &trans,

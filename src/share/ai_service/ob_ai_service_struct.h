@@ -161,6 +161,14 @@ public:
   static int64_t calc_spec_version(const common::ObString &normalized_expr);
   // whether %name follows the hidden column naming scheme above
   static bool is_hidden_column_name(const common::ObString &name);
+  // Reads the user facing definition of one AI column from __all_ai_column.
+  static int load_column_definition(common::ObISQLClient &sql_client,
+                                    common::ObIAllocator &allocator,
+                                    const uint64_t table_id,
+                                    const uint64_t column_id,
+                                    common::ObString &original_expr,
+                                    common::ObString &sync_mode,
+                                    int64_t &max_retries);
   // Splits "FUNC(arg0, arg1, ...)" into the function name and the raw text of each top level
   // argument. Quotes, backticks and nested parentheses are honoured.
   static int split_call_args(const common::ObString &call_text,

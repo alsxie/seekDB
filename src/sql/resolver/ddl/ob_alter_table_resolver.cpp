@@ -617,6 +617,8 @@ int ObAlterTableResolver::resolve_action_list(const ParseNode &node)
         }
       }
     }
+    if (OB_SUCC(ret) && OB_FAIL(check_ai_column_alters(*alter_table_stmt))) {
+    }
     if (OB_SUCC(ret)) {
       for (int64_t i = 0; OB_SUCC(ret) && i < add_index_action_idxs.count(); ++i) {
         ParseNode *action_node = NULL;
@@ -3562,6 +3564,93 @@ int ObAlterTableResolver::gen_ai_column_restart_sql(const ObString &column_name,
     }
   }
   if (OB_SUCC(ret) && OB_FAIL(ob_write_string(*allocator_, buf.string(), sql))) {
+  }
+  return ret;
+}
+
+int ObAlterTableResolver::check_ai_column_alters(ObAlterTableStmt &stmt)
+{
+  int ret = OB_SUCCESS;
+  bool has_ai_column = false;
+  ObSEArray<share::AiColumnMeta, 4> metas;
+  ObSEArray<const AlterColumnSchema *, 4> changes;
+  ObSEArray<uint64_t, 4> dropped_ai_ids;
+  AlterTableSchema &alter_table_schema = stmt.get_alter_table_arg().alter_table_schema_;
+  if (OB_ISNULL(table_schema_)) {
+    ret = OB_NOT_INIT;
+  } else {
+    for (ObTableSchema::const_column_iterator it = table_schema_->column_begin();
+         !has_ai_column && it != table_schema_->column_end(); ++it) {
+      has_ai_column = NULL != *it && (*it)->is_ai_result_column();
+    }
+  }
+  if (OB_FAIL(ret) || !has_ai_column) {
+  } else if (OB_ISNULL(GCTX.sql_proxy_)) {
+    ret = OB_NOT_INIT;
+  } else if (OB_FAIL(share::AiColumnMetaCache::get_instance().get(
+                 *GCTX.sql_proxy_, table_schema_->get_table_id(),
+                 table_schema_->get_schema_version(), metas))) {
+    LOG_WARN("fail to get ai column meta", K(ret));
+  } else {
+    // pass 1: AI columns being dropped or redefined
+    for (ObTableSchema::const_column_iterator it = alter_table_schema.column_begin();
+         OB_SUCC(ret) && it != alter_table_schema.column_end(); ++it) {
+      const AlterColumnSchema *alter_col = static_cast<const AlterColumnSchema *>(*it);
+      const ObColumnSchemaV2 *orig = NULL;
+      if (OB_ISNULL(alter_col)) {
+        ret = OB_ERR_UNEXPECTED;
+      } else if (OB_DDL_DROP_COLUMN != alter_col->alter_type_
+                 && OB_DDL_CHANGE_COLUMN != alter_col->alter_type_
+                 && OB_DDL_MODIFY_COLUMN != alter_col->alter_type_) {
+      } else if (OB_FAIL(changes.push_back(alter_col))) {
+      } else if (OB_ISNULL(orig = table_schema_->get_column_schema(
+                               alter_col->get_origin_column_name()))
+                 || !orig->is_ai_result_column()) {
+      } else if (OB_DDL_DROP_COLUMN == alter_col->alter_type_) {
+        ret = dropped_ai_ids.push_back(orig->get_column_id());
+      } else {
+        ret = OB_NOT_SUPPORTED;
+        LOG_USER_ERROR(OB_NOT_SUPPORTED, "modifying or renaming an AI COLUMN");
+      }
+    }
+    // pass 2: columns read by a remaining AI column keep their name
+    for (int64_t i = 0; OB_SUCC(ret) && i < changes.count(); ++i) {
+      const AlterColumnSchema *alter_col = changes.at(i);
+      const ObString &origin_name = alter_col->get_origin_column_name();
+      const ObColumnSchemaV2 *orig = table_schema_->get_column_schema(origin_name);
+      const bool renamed = OB_DDL_CHANGE_COLUMN == alter_col->alter_type_
+          && !ObCharset::case_insensitive_equal(origin_name, alter_col->get_column_name_str());
+      if (NULL == orig || orig->is_ai_result_column()
+          || (OB_DDL_DROP_COLUMN != alter_col->alter_type_ && !renamed)) {
+        continue;
+      }
+      for (int64_t j = 0; OB_SUCC(ret) && j < metas.count(); ++j) {
+        if (metas.at(j).depends_on(orig->get_column_id())
+            && !has_exist_in_array(dropped_ai_ids, metas.at(j).column_id_)) {
+          ret = OB_ERR_DEPENDENT_BY_GENERATED_COLUMN;
+          LOG_USER_ERROR(OB_ERR_DEPENDENT_BY_GENERATED_COLUMN, origin_name.length(),
+                         origin_name.ptr());
+        }
+      }
+    }
+    // pass 3: hidden bookkeeping columns follow their AI column
+    for (int64_t i = 0; OB_SUCC(ret) && i < dropped_ai_ids.count(); ++i) {
+      const ObColumnSchemaV2 *ai_col = table_schema_->get_column_schema(dropped_ai_ids.at(i));
+      for (int64_t kind = 0; OB_SUCC(ret) && NULL != ai_col
+           && kind < share::AiColumnUtil::HIDDEN_KIND_COUNT; ++kind) {
+        AlterColumnSchema hidden_drop;
+        ObString hidden_name;
+        if (OB_FAIL(share::AiColumnUtil::gen_hidden_column_name(
+                *allocator_, ai_col->get_column_name_str(),
+                static_cast<share::AiColumnUtil::HiddenKind>(kind), hidden_name))) {
+        } else if (NULL == table_schema_->get_column_schema(hidden_name)) {
+        } else if (OB_FAIL(hidden_drop.set_origin_column_name(hidden_name))) {
+        } else if (OB_FAIL(hidden_drop.set_column_name(hidden_name))) {
+        } else if (FALSE_IT(hidden_drop.alter_type_ = OB_DDL_DROP_COLUMN)) {
+        } else if (OB_FAIL(stmt.add_column(hidden_drop))) {
+        }
+      }
+    }
   }
   return ret;
 }

@@ -134,6 +134,10 @@ public:
                                      bool is_agent_mode = false,
                                      ObSQLMode sql_mode = SMO_DEFAULT,
                                      ObCharsetType charset_type = ObCharsetType::CHARSET_UTF8MB4) const;
+  int print_ai_column_definition(const share::schema::ObColumnSchemaV2 &col,
+                                 char *buf,
+                                 int64_t buf_len,
+                                 int64_t &pos) const;
   int print_generated_column_definition(const ObColumnSchemaV2 &gen_col,
                                         char *buf,
                                         int64_t buf_len,

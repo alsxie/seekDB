@@ -569,6 +569,61 @@ int AiColumnUtil::replace_status_pseudo_column(ObIAllocator &allocator,
   return ret;
 }
 
+int AiColumnUtil::load_column_definition(ObISQLClient &sql_client,
+                                         ObIAllocator &allocator,
+                                         const uint64_t table_id,
+                                         const uint64_t column_id,
+                                         ObString &original_expr,
+                                         ObString &sync_mode,
+                                         int64_t &max_retries)
+{
+  int ret = OB_SUCCESS;
+  ObSqlString sql;
+  // HEX keeps the longtext readable as a plain varchar through the inner connection
+  if (OB_FAIL(sql.append_fmt("SELECT HEX(original_expr) AS expr_hex, sync_mode, max_retries "
+                             "FROM %s.%s WHERE table_id = %lu AND column_id = %lu",
+                             OB_SYS_DATABASE_NAME, "__all_ai_column", table_id, column_id))) {
+  } else {
+    SMART_VAR(ObMySQLProxy::MySQLResult, res) {
+      common::sqlclient::ObMySQLResult *result = NULL;
+      ObString expr_hex;
+      ObString mode;
+      if (OB_FAIL(sql_client.read(res, sql.ptr()))) {
+        LOG_WARN("fail to read ai column definition", K(ret), K(sql));
+      } else if (OB_ISNULL(result = res.get_result())) {
+        ret = OB_ERR_UNEXPECTED;
+      } else if (OB_FAIL(result->next())) {
+        if (OB_ITER_END == ret) {
+          ret = OB_ENTRY_NOT_EXIST;
+        }
+      } else {
+        EXTRACT_VARCHAR_FIELD_MYSQL(*result, "expr_hex", expr_hex);
+        EXTRACT_VARCHAR_FIELD_MYSQL(*result, "sync_mode", mode);
+        EXTRACT_INT_FIELD_MYSQL(*result, "max_retries", max_retries, int64_t);
+        char *buf = NULL;
+        const int64_t len = expr_hex.length() / 2;
+        if (OB_FAIL(ret)) {
+        } else if (OB_ISNULL(buf = static_cast<char *>(allocator.alloc(len + 1)))) {
+          ret = OB_ALLOCATE_MEMORY_FAILED;
+        } else {
+          auto nibble = [](const char ch) -> int {
+            return ch >= '0' && ch <= '9' ? ch - '0'
+                 : ch >= 'A' && ch <= 'F' ? ch - 'A' + 10
+                 : ch >= 'a' && ch <= 'f' ? ch - 'a' + 10 : 0;
+          };
+          for (int64_t i = 0; i < len; ++i) {
+            buf[i] = static_cast<char>((nibble(expr_hex.ptr()[2 * i]) << 4)
+                                       | nibble(expr_hex.ptr()[2 * i + 1]));
+          }
+          original_expr.assign_ptr(buf, static_cast<int32_t>(len));
+          ret = ob_write_string(allocator, mode, sync_mode);
+        }
+      }
+    }
+  }
+  return ret;
+}
+
 void AiColumnMeta::reset()
 {
   table_id_ = OB_INVALID_ID;

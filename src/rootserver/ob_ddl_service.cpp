@@ -10445,6 +10445,16 @@ int ObDDLService::alter_table_in_trans(obcall::ObAlterTableArg &alter_table_arg,
                      && OB_FAIL(ObDDLOperator::write_ai_column_meta(
                          trans, new_table_schema, alter_table_arg.ai_column_defs_))) {
             LOG_WARN("fail to write ai column meta", KR(ret));
+          } else {
+            bool had_ai_column = false;
+            for (ObTableSchema::const_column_iterator it = orig_table_schema->column_begin();
+                 !had_ai_column && it != orig_table_schema->column_end(); ++it) {
+              had_ai_column = OB_NOT_NULL(*it) && (*it)->is_ai_result_column();
+            }
+            if (had_ai_column
+                && OB_FAIL(ObDDLOperator::prune_ai_column_meta(trans, new_table_schema))) {
+              LOG_WARN("fail to prune ai column meta", KR(ret));
+            }
           }
         }
         //table options

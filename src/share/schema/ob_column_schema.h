@@ -294,8 +294,11 @@ int assign(const ObColumnSchemaV2 &src_schema);
   inline bool has_generated_column_deps() const { return column_flags_ & GENERATED_DEPS_CASCADE_FLAG; }
   inline bool is_invisible_column() const { return column_flags_ & INVISIBLE_COLUMN_FLAG; }
   inline bool has_column_flag(int64_t flag) const { return column_flags_ & flag; }
-  inline bool is_ai_result_column() const { return column_flags_ & AI_RESULT_COLUMN_FLAG; }
-  inline bool is_ai_hidden_column() const { return column_flags_ & AI_HIDDEN_COLUMN_FLAG; }
+  // an instantly dropped column keeps its flags but is no longer part of the AI column
+  inline bool is_ai_result_column() const
+  { return (column_flags_ & AI_RESULT_COLUMN_FLAG) && !(column_flags_ & UNUSED_COLUMN_FLAG); }
+  inline bool is_ai_hidden_column() const
+  { return (column_flags_ & AI_HIDDEN_COLUMN_FLAG) && !(column_flags_ & UNUSED_COLUMN_FLAG); }
   inline int64_t get_column_flags() const { return column_flags_; }
   //these column flags must be stored in __all_column
   inline int64_t get_stored_column_flags() const { return column_flags_ & STORED_COLUMN_FLAGS_MASK; }
