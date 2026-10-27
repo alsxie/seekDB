@@ -108,6 +108,10 @@ static const uint64_t OB_MIN_ID  = 0;//used for lower_bound
 #define INVISIBLE_COLUMN_FLAG (INT64_C(1) << 6)
 // The logic of the new table without a primary key changes the column (partition key) to the primary key
 #define HEAP_ALTER_ROWKEY_FLAG (INT64_C(1) << 8)
+// AI column (asynchronous model generated column): the user visible result column and the hidden
+// bookkeeping columns that belong to it. 作者：FDE WorkMate
+#define AI_RESULT_COLUMN_FLAG (INT64_C(1) << 9)
+#define AI_HIDDEN_COLUMN_FLAG (INT64_C(1) << 10)
 #define HEAP_TABLE_SORT_ROWKEY_FLAG (INT64_C(1) << 12) // 1:sortkey in new no pk table
 #define COLUMN_NOT_NULL_CONSTRAINT_FLAG (INT64_C(1) << 13)
 #define NOT_NULL_ENABLE_FLAG (INT64_C(1) << 14)

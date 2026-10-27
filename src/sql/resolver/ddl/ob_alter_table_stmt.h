@@ -104,6 +104,11 @@ public:
     alter_table_arg_.lock_session_create_ts_ = create_ts;
   }
   void set_lock_priority();
+public:
+  // AI COLUMN: statements run by the executor after the DDL (or instead of it for RETRY AI
+  // COLUMN), each one (re)starts the requests of an AI column. 作者：FDE WorkMate
+  bool is_ai_column_retry_ = false;
+  common::ObSEArray<common::ObString, 1> ai_column_sqls_;
 private:
   obcall::ObAlterTableArg alter_table_arg_;
   bool is_comment_table_;

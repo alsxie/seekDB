@@ -42,6 +42,7 @@
 #include "sql/resolver/ddl/ob_ddl_resolver.h"
 #include "sql/hybrid_search/ob_hybrid_search_executor.h"
 #include "sql/engine/basic/file_sql/file_scanner.h"
+#include "share/ai_service/ob_ai_service_struct.h"
 
 namespace oceanbase
 {
@@ -1837,6 +1838,7 @@ int ObDMLResolver::resolve_basic_column_item(const TableItem &table_item,
   ObColumnRefRawExpr *col_expr = NULL;
   ObSchemaGetterGuard *schema_guard = NULL;
   ColumnItem column_item;
+  const bool user_include_hidden = include_hidden;
   if (NULL == stmt) {
     stmt = get_stmt();
   }
@@ -1879,6 +1881,11 @@ int ObDMLResolver::resolve_basic_column_item(const TableItem &table_item,
           params_.hidden_column_name_ = OB_HIDDEN_PK_INCREMENT_COLUMN_NAME;
         }
       }
+    }
+    if (!include_hidden && session_info_->is_inner() && !session_info_->is_user_session()
+        && share::AiColumnUtil::is_hidden_column_name(column_name)) {
+      // the AI column worker addresses the hidden bookkeeping columns by name
+      include_hidden = true;
     }
     if (OB_FAIL(ret)) {
       //do nothing
@@ -1958,6 +1965,66 @@ int ObDMLResolver::resolve_basic_column_item(const TableItem &table_item,
       } else if (OB_FAIL(col_expr->pull_relation_id())) {
       } else {
         col_item = stmt->get_column_item(stmt->get_column_size() - 1);
+      }
+    }
+  }
+  if (OB_SUCC(ret) && !user_include_hidden && NULL != col_item && NULL != col_item->expr_
+      && col_item->expr_->is_ai_result_column() && T_INSERT_SCOPE != current_scope_
+      && OB_FAIL(check_ai_column_strict_read(table_item, *col_item))) {
+  }
+  return ret;
+}
+
+// With ai_column_strict_read on, a user statement reading an AI result column fails while any
+// row of that column is not READY.  Such statements never enter the plan cache.
+int ObDMLResolver::check_ai_column_strict_read(const TableItem &table_item,
+                                               const ColumnItem &col_item)
+{
+  int ret = OB_SUCCESS;
+  bool strict_read = false;
+  const ObTableSchema *table_schema = NULL;
+  const ObDatabaseSchema *db_schema = NULL;
+  ObString state_name;
+  ObSqlString sql;
+  if (OB_ISNULL(session_info_) || OB_ISNULL(schema_checker_) || OB_ISNULL(allocator_)
+      || OB_ISNULL(params_.query_ctx_)) {
+    ret = OB_NOT_INIT;
+  } else if (session_info_->is_inner() && !session_info_->is_user_session()) {
+    // the AI column worker and other internal statements see the raw state
+  } else if (OB_FAIL(session_info_->get_sys_variable(share::SYS_VAR_AI_COLUMN_STRICT_READ,
+                                                     strict_read))) {
+  } else if (!strict_read) {
+  } else if (FALSE_IT(params_.query_ctx_->has_ai_column_strict_read_ = true)) {
+  } else if (OB_FAIL(schema_checker_->get_table_schema(table_item.ref_id_, table_schema))) {
+  } else if (OB_ISNULL(table_schema)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (OB_FAIL(schema_checker_->get_database_schema(
+                                                          table_schema->get_database_id(),
+                                                          db_schema))) {
+  } else if (OB_ISNULL(db_schema) || OB_ISNULL(GCTX.sql_proxy_)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (OB_FAIL(share::AiColumnUtil::gen_hidden_column_name(
+                 *allocator_, col_item.column_name_, share::AiColumnUtil::HIDDEN_STATE,
+                 state_name))) {
+  } else if (OB_FAIL(sql.append_fmt("SELECT 1 AS not_ready FROM `%.*s`.`%.*s` WHERE `%.*s` <> %d LIMIT 1",
+                                    db_schema->get_database_name_str().length(),
+                                    db_schema->get_database_name_str().ptr(),
+                                    table_schema->get_table_name_str().length(),
+                                    table_schema->get_table_name_str().ptr(),
+                                    state_name.length(), state_name.ptr(),
+                                    share::AI_ROW_STATE_READY))) {
+  } else {
+    SMART_VAR(ObMySQLProxy::MySQLResult, res) {
+      common::sqlclient::ObMySQLResult *result = NULL;
+      if (OB_FAIL(GCTX.sql_proxy_->read(res, sql.ptr()))) {
+        LOG_WARN("fail to check ai column state", K(ret), K(sql));
+      } else if (OB_ISNULL(result = res.get_result())) {
+        ret = OB_ERR_UNEXPECTED;
+      } else if (OB_SUCC(result->next())) {
+        ret = OB_AI_COLUMN_NOT_READY;
+        LOG_USER_ERROR(OB_AI_COLUMN_NOT_READY, table_schema->get_table_id(), col_item.column_id_);
+      } else if (OB_ITER_END == ret) {
+        ret = OB_SUCCESS;
       }
     }
   }
@@ -5927,6 +5994,11 @@ int ObDMLResolver::check_basic_column_generated(const ObColumnRefRawExpr *col_ex
   if (OB_ISNULL(col_expr) || OB_ISNULL(dml_stmt)) {
     ret = OB_ERR_UNEXPECTED;
   } else if (col_expr->is_generated_column()) {
+    is_generated = true;
+  } else if ((col_expr->is_ai_result_column() || col_expr->is_ai_hidden_column())
+             && (OB_ISNULL(session_info_) || !session_info_->is_inner()
+                 || session_info_->is_user_session())) {
+    // AI columns are written by the AI column worker only
     is_generated = true;
   } else if (OB_ISNULL(table_item = dml_stmt->get_table_item_by_id(col_expr->get_table_id()))) {
     ret = OB_ERR_UNEXPECTED;

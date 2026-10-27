@@ -586,7 +586,8 @@ public:
       ori_question_marks_count_(0),
       type_demotion_flag_(0),
       has_hybrid_search_(false),
-      has_file_table_(false)
+      has_file_table_(false),
+      has_ai_column_strict_read_(false)
   {
   }
   TO_STRING_KV(N_PARAM_NUM, question_marks_count_,
@@ -631,6 +632,7 @@ public:
     type_demotion_flag_ = 0;
     has_hybrid_search_ = false;
     has_file_table_ = false;
+    has_ai_column_strict_read_ = false;
   }
 
   int64_t get_new_stmt_id() { return stmt_count_++; }
@@ -745,6 +747,8 @@ public:
   // the query reads local files (read_csv / read_json / read_parquet / glob);
   // its plan embeds a file snapshot and must not be cached
   bool has_file_table_;
+  // statement reads an AI column under ai_column_strict_read, never plan cached
+  bool has_ai_column_strict_read_;
 };
 
 } /* ns sql*/

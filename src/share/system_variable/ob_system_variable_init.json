@@ -10988,5 +10988,18 @@
     "info_cn": "是否允许通过 read_csv/read_json/read_parquet/glob 查询本地文件以及 COPY ... TO 导出",
     "background_cn": "",
     "ref_url": ""
+  },
+  "ai_column_strict_read": {
+    "id": 10755,
+    "name": "ai_column_strict_read",
+    "default_value": "0",
+    "base_value": "0",
+    "data_type": "bool",
+    "info": "reject statements that reference an AI column while any row of that column is not READY",
+    "flags": "GLOBAL | SESSION | NEED_SERIALIZE | INFLUENCE_PLAN",
+    "publish_version": "1.0.0.0",
+    "info_cn": "开启后，语句引用的 AI 列只要存在未完成（非 READY）的行即报错",
+    "background_cn": "",
+    "ref_url": ""
   }
 }

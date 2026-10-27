@@ -115,6 +115,8 @@ OB_SERIALIZE_MEMBER(ObForeignKeyCheckerCtdef,
 OB_SERIALIZE_MEMBER(ObTriggerArg, trigger_id_, trigger_events_.bit_value_, timing_points_.bit_value_);
 
 OB_SERIALIZE_MEMBER(ObForeignKeyColumn, name_, idx_, name_idx_, obj_meta_);
+OB_SERIALIZE_MEMBER(ObAiColumnTaskArg, table_id_, column_id_, state_idx_, request_idx_,
+                    spec_version_);
 
 // OB_SERIALIZE_MEMBER(ObForeignKeyArg,
 //                     ref_action_,
@@ -201,7 +203,9 @@ OB_SERIALIZE_MEMBER(ObDMLBaseCtDef,
                     is_table_without_pk_, // FARM COMPAT WHITELIST, renamed
                     reserved_advanced_trigger_,
                     trans_info_expr_,
-                    is_vec_hnsw_index_vid_opt_);
+                    is_vec_hnsw_index_vid_opt_,
+                    ai_task_args_,
+                    ai_rowkey_columns_);
 
 OB_SERIALIZE_MEMBER(ObMultiInsCtDef,
                     calc_part_id_expr_,

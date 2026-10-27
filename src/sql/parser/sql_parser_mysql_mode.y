@@ -368,7 +368,7 @@ END_P SET_VAR DELIMITER
         QUANTIFIER_TABLE QUARTER QUERY QUEUE_TIME QUICK
 
         RECOVER REDUNDANT REFRESH RELAY RELAYLOG RELAY_LOG_FILE RELAY_LOG_POS RELAY_THREAD RELOAD REMOVE
-        REPEATABLE RESET RESPECT RESTART RESTORE RESUME RETURNED_SQLSTATE RETURNS RETURNING REVERSE
+        REPEATABLE RESET RESPECT RESTART RESTORE RESUME RETURNED_SQLSTATE RETURNS RETURNING RETRY REVERSE
         REWRITE ROLLBACK ROLLUP ROUTINE ROW ROWID ROW_COUNT ROW_FORMAT ROWS RTREE
         RUN RECYCLEBIN REPLICATION ROTATE ROW_NUMBER RUDUNDANT RECURSIVE RANDOM REDO_TRANSPORT_OPTIONS
         RANK READ_ONLY RECOVERY REJECT ROLE
@@ -533,6 +533,7 @@ END_P SET_VAR DELIMITER
 %type <node> skip_index_type opt_skip_index_type_list
 %type <node> vec_index_params vec_index_param vec_index_param_value opt_with_vector_index_parameters
 %type <node> file_table_expr opt_file_table_args file_table_arg_list file_table_arg file_option_value
+%type <node> opt_ai_column_options
 %type <node> copy_stmt opt_copy_options copy_option_list copy_option
 %type <node> json_table_expr unnest_expr mock_jt_on_error_on_empty jt_column_list json_table_column_def
 %type <node> json_table_ordinality_column_def json_table_exists_column_def json_table_value_column_def json_table_nested_column_def
@@ -4887,6 +4888,18 @@ column_definition_ref data_type opt_column_attribute_list opt_column_reference o
   merge_nodes(attributes, result, T_COLUMN_ATTRIBUTES, $10);
   malloc_non_terminal_node($$, result->malloc_pool_, T_COLUMN_DEFINITION, 7, $1, $2, attributes, $7, $9, $12, $4);
 }
+| column_definition_ref data_type AI COLUMN '(' expr ')' opt_ai_column_options opt_column_attribute_list opt_position_column
+{
+  /* col type AI COLUMN (AI_COMPLETE(...) | AI_EMBED(...)) [WITH (name = value, ...)] */
+  ParseNode *attributes = NULL;
+  ParseNode *ai_node = NULL;
+  dup_expr_string($6, result, @6.first_column, @6.last_column);
+  malloc_non_terminal_node(ai_node, result->malloc_pool_, T_AI_COLUMN_DEFINITION, 2, $6, $8);
+  malloc_non_terminal_node(attributes, result->malloc_pool_, T_LINK_NODE, 2, $9, ai_node);
+  merge_nodes(attributes, result, T_COLUMN_ATTRIBUTES, attributes);
+  set_data_type_collation($2, attributes, false, true);
+  malloc_non_terminal_node($$, result->malloc_pool_, T_COLUMN_DEFINITION, 4, $1, $2, attributes, $10);
+}
 | column_definition_ref SERIAL opt_column_attribute_list opt_position_column 
 {
   ParseNode *unsigned_bigint_type = NULL;
@@ -4912,6 +4925,14 @@ column_definition_ref data_type opt_column_attribute_list opt_column_reference o
   malloc_non_terminal_node(attributes, result->malloc_pool_, T_LINK_NODE, 2, attributes, unique_attr);
   merge_nodes(attributes, result, T_COLUMN_ATTRIBUTES, attributes);
   malloc_non_terminal_node($$, result->malloc_pool_, T_COLUMN_DEFINITION, 4, $1, unsigned_bigint_type, attributes, $4);
+}
+;
+
+opt_ai_column_options:
+/* EMPTY */ { $$ = NULL; }
+| WITH '(' file_table_arg_list ')'
+{
+  merge_nodes($$, result, T_FILE_TABLE_OPTION_LIST, $3);
 }
 ;
 
@@ -12703,6 +12724,11 @@ SHOW opt_extended_or_full TABLES opt_from_or_in_database_clause opt_show_conditi
   $$->value_ = $2[0];
   malloc_non_terminal_node($$, result->malloc_pool_, T_SHOW_COLUMNS, 4, $$, $5, $6, $7);
 }
+| SHOW AI COLUMNS from_or_in relation_factor opt_from_or_in_database_clause
+{
+  (void)$4;
+  malloc_non_terminal_node($$, result->malloc_pool_, T_SHOW_AI_COLUMNS, 2, $5, $6);
+}
 | SHOW TABLE STATUS opt_from_or_in_database_clause opt_show_condition
 { malloc_non_terminal_node($$, result->malloc_pool_, T_SHOW_TABLE_STATUS, 2, $4, $5); }
 | SHOW PROCEDURE STATUS opt_from_or_in_database_clause opt_show_condition
@@ -14761,6 +14787,18 @@ opt_set table_option_list_space_seperated
 | alter_column_option
 {
   malloc_non_terminal_node($$, result->malloc_pool_, T_ALTER_COLUMN_OPTION, 1, $1);
+}
+| RETRY AI COLUMN column_definition_ref
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_AI_COLUMN_RETRY, 2, $4, NULL);
+}
+| RETRY AI COLUMN column_definition_ref WHERE expr
+{
+  /* the raw predicate text is kept so that the STATUS pseudo column can be bound */
+  ParseNode *text_node = NULL;
+  malloc_terminal_node(text_node, result->malloc_pool_, T_VARCHAR);
+  dup_expr_string(text_node, result, @6.first_column, @6.last_column);
+  malloc_non_terminal_node($$, result->malloc_pool_, T_AI_COLUMN_RETRY, 3, $4, $6, text_node);
 }
 | RENAME opt_to relation_factor
 {
@@ -18127,6 +18165,7 @@ ACCOUNT
 |       RETURNED_SQLSTATE
 |       RETURNING
 |       RETURNS
+|       RETRY
 |       REVERSE
 |       REWRITE
 |       ROLE

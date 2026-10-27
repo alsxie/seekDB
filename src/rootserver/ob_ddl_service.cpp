@@ -10441,6 +10441,10 @@ int ObDDLService::alter_table_in_trans(obcall::ObAlterTableArg &alter_table_arg,
                                                 ddl_operator,
                                                 trans,
                                                 &global_idx_schema_array))) {
+          } else if (alter_table_arg.ai_column_defs_.count() > 0
+                     && OB_FAIL(ObDDLOperator::write_ai_column_meta(
+                         trans, new_table_schema, alter_table_arg.ai_column_defs_))) {
+            LOG_WARN("fail to write ai column meta", KR(ret));
           }
         }
         //table options

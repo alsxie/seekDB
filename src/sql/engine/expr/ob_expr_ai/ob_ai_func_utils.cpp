@@ -1542,6 +1542,26 @@ int ObAIFuncUtils::get_ai_func_info(ObIAllocator &allocator, const ObString &mod
   return ret;
 }
 
+// Pulls the optional "system_prompt" key out of a completion config so that it is
+// sent as the system message instead of being merged into the request body.
+static int extract_system_prompt(ObJsonObject *config, ObString &system_prompt)
+{
+  int ret = OB_SUCCESS;
+  const ObString key("system_prompt");
+  system_prompt.reset();
+  ObJsonNode *node = nullptr;
+  if (OB_ISNULL(config) || OB_ISNULL(node = config->get_value(key))) {
+  } else if (node->json_type() != ObJsonNodeType::J_STRING) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_USER_ERROR(OB_INVALID_ARGUMENT, "ai_complete, system_prompt must be a string");
+  } else {
+    system_prompt = static_cast<ObJsonString *>(node)->value();
+    if (OB_FAIL(config->remove(key))) {
+    }
+  }
+  return ret;
+}
+
 int ObAIFuncModel::call_completion(ObString &prompt, ObJsonObject *config, ObString &result)
 {
   int ret = OB_SUCCESS;
@@ -1558,6 +1578,7 @@ int ObAIFuncModel::call_completion(ObString &prompt, ObJsonObject *config, ObStr
   if (!is_completion_type()) {
     ret = OB_INVALID_ARGUMENT;
     LOG_USER_ERROR(OB_INVALID_ARGUMENT, "ai_complete, info type is not completion");
+  } else if (OB_FAIL(extract_system_prompt(config, prompt_str))) {
   } else if (OB_FAIL(ObAIFuncUtils::get_complete_provider(*allocator_, endpoint_info_, complete_provider))) {
   } else if (OB_FAIL(endpoint_info_.get_unencrypted_access_key(*allocator_, unencrypted_access_key))) {
   } else if (OB_FAIL(complete_provider->get_header(*allocator_, unencrypted_access_key, headers))) {
@@ -1600,6 +1621,7 @@ int ObAIFuncModel::call_completion_vector(ObArray<ObString> &prompts, ObJsonObje
   if (!is_completion_type()) {
     ret = OB_INVALID_ARGUMENT;
     LOG_USER_ERROR(OB_INVALID_ARGUMENT, "ai_complete, info type is not completion");
+  } else if (OB_FAIL(extract_system_prompt(config, prompt_str))) {
   } else if (OB_FAIL(ObAIFuncUtils::get_complete_provider(*allocator_, endpoint_info_, complete_provider))) {
   } else if (OB_FAIL(endpoint_info_.get_unencrypted_access_key(*allocator_, unencrypted_access_key))) {
   } else if (OB_FAIL(complete_provider->get_header(*allocator_, unencrypted_access_key, headers))) {

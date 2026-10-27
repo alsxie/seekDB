@@ -1340,6 +1340,7 @@ SQL_UNITY_GROUPS = [
             "src/sql/resolver/ddl/ob_alter_outline_resolver.cpp",
             "src/sql/resolver/ddl/ob_alter_routine_resolver.cpp",
             "src/sql/resolver/ddl/ob_alter_table_resolver.cpp",
+            "src/sql/resolver/ddl/ob_ai_column_resolver.cpp",
             "src/sql/resolver/ddl/ob_alter_table_stmt.cpp",
             "src/sql/resolver/ddl/ob_analyze_stmt.cpp",
             "src/sql/resolver/ddl/ob_analyze_stmt_resolver.cpp",

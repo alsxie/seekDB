@@ -97,6 +97,57 @@ ObDDLOperator::ObDDLOperator(
 {
 }
 
+// 作者：FDE WorkMate
+int ObDDLOperator::write_ai_column_meta(ObISQLClient &trans,
+                                        const ObTableSchema &table,
+                                        const ObIArray<share::AiColumnDef> &defs)
+{
+  int ret = OB_SUCCESS;
+  for (int64_t i = 0; OB_SUCC(ret) && i < defs.count(); ++i) {
+    const share::AiColumnDef &def = defs.at(i);
+    const ObColumnSchemaV2 *col = table.get_column_schema(def.column_name_);
+    const ObColumnSchemaV2 *state_col = table.get_column_schema(def.state_column_name_);
+    const ObColumnSchemaV2 *req_col = table.get_column_schema(def.request_column_name_);
+    const ObColumnSchemaV2 *spec_col = table.get_column_schema(def.result_spec_column_name_);
+    ObSqlString dep_ids;
+    ObSqlString sql;
+    int64_t affected_rows = 0;
+    if (OB_ISNULL(col) || OB_ISNULL(state_col) || OB_ISNULL(req_col) || OB_ISNULL(spec_col)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("ai column or its hidden columns not found", K(ret), K(def));
+    } else {
+      // map dependency column names to ids of the final table schema
+      ObString names = def.dependency_names_;
+      while (OB_SUCC(ret) && !names.empty()) {
+        ObString name = names.split_on(',');
+        if (name.empty()) {
+          name = names;
+          names.reset();
+        }
+        const ObColumnSchemaV2 *dep_col = table.get_column_schema(name.trim());
+        if (OB_ISNULL(dep_col)) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("ai column dependency not found", K(ret), K(name), K(def));
+        } else if (OB_FAIL(dep_ids.append_fmt("%s%lu", dep_ids.empty() ? "" : ",",
+                                              dep_col->get_column_id()))) {
+        }
+      }
+    }
+    if (OB_FAIL(ret)) {
+    } else if (OB_FAIL(def.gen_meta_insert_sql(table.get_table_id(), col->get_column_id(),
+                                               state_col->get_column_id(),
+                                               req_col->get_column_id(),
+                                               spec_col->get_column_id(),
+                                               dep_ids.string(), sql))) {
+    } else if (OB_FAIL(trans.write(sql.ptr(), affected_rows))) {
+      LOG_WARN("fail to write ai column meta", K(ret), K(sql));
+    } else if (OB_UNLIKELY(1 != affected_rows)) {
+      ret = OB_ERR_UNEXPECTED;
+    }
+  }
+  return ret;
+}
+
 ObDDLOperator::~ObDDLOperator()
 {
 }

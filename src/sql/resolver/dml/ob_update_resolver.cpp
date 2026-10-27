@@ -106,6 +106,12 @@ int ObUpdateResolver::resolve(const ParseNode &parse_tree)
   }
 
   if (OB_SUCC(ret)) {
+    if (OB_FAIL(add_ai_column_assignments(tables_assign))) {
+      LOG_WARN("fail to add ai column assignments", K(ret));
+    }
+  }
+
+  if (OB_SUCC(ret)) {
     // Parse cascading update columns
     if (OB_FAIL(resolve_additional_assignments(tables_assign,
                                                T_UPDATE_SCOPE))) {

@@ -25,6 +25,8 @@
 #include "sql/session/ob_local_session_var.h"
 #include "query/command/ob_root_command_service.h"
 #include "query/vector/ob_vector_index_util.h"
+#include "sql/resolver/ddl/ob_ai_column_resolver.h"
+#include "share/ai_service/ob_ai_service_struct.h"
 
 namespace oceanbase
 {
@@ -401,6 +403,14 @@ int ObAlterTableResolver::resolve_action_list(const ParseNode &node)
       } else if (FALSE_IT(alter_table_stmt->inc_alter_table_action_count())) {
       } else {
         switch (action_node->type_) {
+        case T_AI_COLUMN_RETRY: {
+          if (node.num_child_ > 1) {
+            ret = OB_NOT_SUPPORTED;
+            LOG_USER_ERROR(OB_NOT_SUPPORTED, "combining AI COLUMN RETRY with another ALTER action");
+          } else if (OB_FAIL(resolve_ai_column_retry(*action_node))) {
+          }
+          break;
+        }
         //deal with alter table option
         case T_ALTER_TABLE_OPTION: {
             alter_table_stmt->set_alter_table_option();
@@ -3453,15 +3463,138 @@ int ObAlterTableResolver::resolve_add_column(const ParseNode &node, ObColumnName
           }
         }
 
+        // AI COLUMN: validate the definition and add its hidden bookkeeping columns
+        const ParseNode *ai_node = AiColumnResolver::get_ai_column_node(node.children_[i]);
+        share::AiColumnDef ai_def;
+        ObSEArray<ObColumnSchemaV2, 3> ai_hidden_columns;
+        if (OB_SUCC(ret) && NULL != ai_node) {
+          ObSEArray<ObString, 4> dep_names;
+          ObSEArray<ObColumnSchemaV2 *, 1> no_new_columns;
+          if (OB_FAIL(AiColumnResolver::resolve_definition(*allocator_, *ai_node,
+                                                           alter_column_schema, ai_def,
+                                                           dep_names))) {
+          } else if (OB_FAIL(AiColumnResolver::check_dependencies(*table_schema_, no_new_columns,
+                                                                  ai_def, dep_names))) {
+          } else if (OB_FAIL(AiColumnResolver::build_hidden_columns(*allocator_,
+                                                                    alter_column_schema,
+                                                                    ai_def,
+                                                                    ai_hidden_columns))) {
+          }
+        }
+
         //add column
         if (OB_SUCC(ret)) {
           if (OB_FAIL(alter_table_stmt->add_column(alter_column_schema))) {
           } else if (FALSE_IT(alter_table_stmt->set_sql_mode(session_info_->get_sql_mode()))) {
           }
         }
+        for (int64_t j = 0; OB_SUCC(ret) && j < ai_hidden_columns.count(); ++j) {
+          AlterColumnSchema hidden_column;
+          if (NULL != table_schema_->get_column_schema(ai_hidden_columns.at(j).get_column_name_str())) {
+            ret = OB_ERR_COLUMN_DUPLICATE;
+            LOG_USER_ERROR(OB_ERR_COLUMN_DUPLICATE,
+                           ai_hidden_columns.at(j).get_column_name_str().length(),
+                           ai_hidden_columns.at(j).get_column_name_str().ptr());
+          } else if (OB_FAIL(hidden_column.assign(ai_hidden_columns.at(j)))) {
+          } else {
+            hidden_column.alter_type_ = OB_DDL_ADD_COLUMN;
+            if (OB_FAIL(alter_table_stmt->add_column(hidden_column))) {
+            }
+          }
+        }
+        if (OB_SUCC(ret) && NULL != ai_node) {
+          ObString backfill_sql;
+          if (OB_FAIL(alter_table_stmt->get_alter_table_arg().ai_column_defs_.push_back(ai_def))) {
+          } else if (OB_FAIL(gen_ai_column_restart_sql(ai_def.column_name_, ObString(),
+                                                       backfill_sql))) {
+          } else if (OB_FAIL(alter_table_stmt->ai_column_sqls_.push_back(backfill_sql))) {
+          }
+        }
       }
     }
     add_column_cnt_++;
+  }
+  return ret;
+}
+
+int ObAlterTableResolver::gen_ai_column_restart_sql(const ObString &column_name,
+                                                    const ObString &where_text,
+                                                    ObString &sql)
+{
+  int ret = OB_SUCCESS;
+  const ObDatabaseSchema *db_schema = NULL;
+  ObString state_name;
+  ObString request_name;
+  ObSqlString buf;
+  if (OB_ISNULL(table_schema_) || OB_ISNULL(schema_checker_) || OB_ISNULL(allocator_)) {
+    ret = OB_NOT_INIT;
+  } else if (OB_FAIL(schema_checker_->get_database_schema(
+                                                          table_schema_->get_database_id(),
+                                                          db_schema))) {
+  } else if (OB_ISNULL(db_schema)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (OB_FAIL(share::AiColumnUtil::gen_hidden_column_name(
+                 *allocator_, column_name, share::AiColumnUtil::HIDDEN_STATE, state_name))) {
+  } else if (OB_FAIL(share::AiColumnUtil::gen_hidden_column_name(
+                 *allocator_, column_name, share::AiColumnUtil::HIDDEN_REQUEST, request_name))) {
+  } else if (OB_FAIL(buf.append_fmt("UPDATE `%.*s`.`%.*s` SET `%.*s` = %d, `%.*s` = uuid_short(), "
+                                    "`%.*s` = NULL",
+                                    db_schema->get_database_name_str().length(),
+                                    db_schema->get_database_name_str().ptr(),
+                                    table_schema_->get_table_name_str().length(),
+                                    table_schema_->get_table_name_str().ptr(),
+                                    state_name.length(), state_name.ptr(),
+                                    share::AI_ROW_STATE_PENDING,
+                                    request_name.length(), request_name.ptr(),
+                                    column_name.length(), column_name.ptr()))) {
+  } else if (!where_text.empty()) {
+    // a bare "status" names the row state of the AI column, `status` the user column
+    ObSqlString status_expr;
+    ObString where;
+    if (OB_FAIL(status_expr.append_fmt("(CASE `%.*s` WHEN %d THEN 'PENDING' WHEN %d THEN 'READY' "
+                                       "WHEN %d THEN 'FAILED' END)",
+                                       state_name.length(), state_name.ptr(),
+                                       share::AI_ROW_STATE_PENDING, share::AI_ROW_STATE_READY,
+                                       share::AI_ROW_STATE_FAILED))) {
+    } else if (OB_FAIL(share::AiColumnUtil::replace_status_pseudo_column(
+                   *allocator_, where_text, status_expr.string(), where))) {
+    } else if (OB_FAIL(buf.append_fmt(" WHERE (%.*s)", where.length(), where.ptr()))) {
+    }
+  }
+  if (OB_SUCC(ret) && OB_FAIL(ob_write_string(*allocator_, buf.string(), sql))) {
+  }
+  return ret;
+}
+
+int ObAlterTableResolver::resolve_ai_column_retry(const ParseNode &node)
+{
+  int ret = OB_SUCCESS;
+  ObAlterTableStmt *alter_table_stmt = get_alter_table_stmt();
+  const ParseNode *col_ref = node.num_child_ > 0 ? node.children_[0] : NULL;
+  const ParseNode *name_node = NULL;
+  const ParseNode *where_node = node.num_child_ > 2 ? node.children_[2] : NULL;
+  const ObColumnSchemaV2 *column = NULL;
+  ObString column_name;
+  ObString where_text;
+  ObString sql;
+  if (OB_ISNULL(alter_table_stmt) || OB_ISNULL(table_schema_)) {
+    ret = OB_NOT_INIT;
+  } else if (OB_ISNULL(col_ref) || col_ref->num_child_ < 3
+             || OB_ISNULL(name_node = col_ref->children_[2])) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (FALSE_IT(column_name.assign_ptr(name_node->str_value_,
+                                             static_cast<int32_t>(name_node->str_len_)))) {
+  } else if (OB_ISNULL(column = table_schema_->get_column_schema(column_name))
+             || !column->is_ai_result_column()) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "retrying a column that is not an AI column");
+  } else if (NULL != where_node
+             && FALSE_IT(where_text.assign_ptr(where_node->str_value_,
+                                               static_cast<int32_t>(where_node->str_len_)))) {
+  } else if (OB_FAIL(gen_ai_column_restart_sql(column->get_column_name_str(), where_text, sql))) {
+  } else if (OB_FAIL(alter_table_stmt->ai_column_sqls_.push_back(sql))) {
+  } else {
+    alter_table_stmt->is_ai_column_retry_ = true;
   }
   return ret;
 }
