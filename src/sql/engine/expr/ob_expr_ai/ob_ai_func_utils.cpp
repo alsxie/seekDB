@@ -296,11 +296,11 @@ int ObOllamaUtils::get_header(common::ObIAllocator &allocator,
                               common::ObArray<ObString> &headers)
 {
   int ret = OB_SUCCESS;
+  // same layout as the OpenAI header: ["Authorization: Bearer *", "Content-Type: application/json"],
+  // the authorization line is omitted when no key is configured
   ObString content_type_str("Content-Type: application/json");
   ObString content_type_c_str;
-  if (OB_FAIL(ob_write_string(allocator, content_type_str, content_type_c_str, true))) {
-  } else if (OB_FAIL(headers.push_back(content_type_c_str))) {
-  } else if (!api_key.empty()) {
+  if (!api_key.empty()) {
     ObSqlString auth_header;
     ObString auth_header_str;
     if (OB_FAIL(auth_header.append_fmt("Authorization: Bearer %.*s", api_key.length(), api_key.ptr()))) {
@@ -308,7 +308,32 @@ int ObOllamaUtils::get_header(common::ObIAllocator &allocator,
     } else if (OB_FAIL(headers.push_back(auth_header_str))) {
     }
   }
+  if (OB_FAIL(ret)) {
+  } else if (OB_FAIL(ob_write_string(allocator, content_type_str, content_type_c_str, true))) {
+  } else if (OB_FAIL(headers.push_back(content_type_c_str))) {
+  }
   return ret;
+}
+
+bool ObOllamaUtils::is_api_path(const common::ObString &url, const char *path)
+{
+  // compare the trailing path of the url, ignoring query string, fragment and trailing '/'
+  bool matched = false;
+  if (OB_NOT_NULL(path) && OB_NOT_NULL(url.ptr())) {
+    const int64_t path_len = STRLEN(path);
+    int64_t url_len = url.length();
+    for (int64_t i = 0; i < url_len; i++) {
+      if (url.ptr()[i] == '?' || url.ptr()[i] == '#') {
+        url_len = i;
+      }
+    }
+    while (url_len > 0 && url.ptr()[url_len - 1] == '/') {
+      url_len--;
+    }
+    matched = url_len >= path_len
+              && 0 == STRNCASECMP(url.ptr() + url_len - path_len, path, path_len);
+  }
+  return matched;
 }
 
 int ObOllamaUtils::apply_generate_config(common::ObIAllocator &allocator,
@@ -381,24 +406,34 @@ int ObOllamaUtils::ObOllamaComplete::get_body(common::ObIAllocator &allocator,
   if (model.empty() || content.empty()) { 
     ret = OB_INVALID_ARGUMENT;
   } else {
-    // native /api/generate request:
-    // {"model": "llama3.1", "prompt": "...", "system": "...", "stream": false, "options": {...}}
+    // native requests, chosen by the endpoint path:
+    // /api/chat:     {"model": "*", "messages": [{"role": "system", ...}, {"role": "user", ...}], "stream": false}
+    // /api/generate: {"model": "*", "prompt": "*", "system": "*", "stream": false, "options": {...}}
     ObJsonObject *body_obj = nullptr;
     ObJsonString *model_str = nullptr;
-    ObJsonString *content_str = nullptr;
     ObJsonBoolean *stream_obj = nullptr;
     if (OB_FAIL(ObAIFuncJsonUtils::get_json_object(allocator, body_obj))) {
     } else if (OB_FAIL(ObAIFuncJsonUtils::get_json_string(allocator, model, model_str))) {
     } else if (OB_FAIL(body_obj->add("model", model_str))) {
-    } else if (OB_FAIL(ObAIFuncJsonUtils::get_json_string(allocator, content, content_str))) {
-    } else if (OB_FAIL(body_obj->add("prompt", content_str))) {
+    } else if (ObOllamaUtils::is_api_path(request_url_, CHAT_API_PATH)) {
+      ObJsonArray *messages = nullptr;
+      if (OB_FAIL(ObOpenAIUtils::ObOpenAIComplete::construct_messages_array(allocator, prompt, content, messages))) {
+      } else if (OB_FAIL(body_obj->add("messages", messages))) {
+      }
+    } else {
+      ObJsonString *content_str = nullptr;
+      if (OB_FAIL(ObAIFuncJsonUtils::get_json_string(allocator, content, content_str))) {
+      } else if (OB_FAIL(body_obj->add("prompt", content_str))) {
+      } else if (!prompt.empty()) {
+        ObJsonString *system_str = nullptr;
+        if (OB_FAIL(ObAIFuncJsonUtils::get_json_string(allocator, prompt, system_str))) {
+        } else if (OB_FAIL(body_obj->add("system", system_str))) {
+        }
+      }
+    }
+    if (OB_FAIL(ret)) {
     } else if (OB_FAIL(ObAIFuncJsonUtils::get_json_boolean(allocator, false, stream_obj))) {
     } else if (OB_FAIL(body_obj->add("stream", stream_obj))) {
-    } else if (!prompt.empty()) {
-      ObJsonString *system_str = nullptr;
-      if (OB_FAIL(ObAIFuncJsonUtils::get_json_string(allocator, prompt, system_str))) {
-      } else if (OB_FAIL(body_obj->add("system", system_str))) {
-      }
     }
     if (OB_FAIL(ret)) {
     } else if (OB_FAIL(ObOllamaUtils::apply_generate_config(allocator, config, body_obj))) {
@@ -882,17 +917,17 @@ int ObAIFuncUtils::get_header(ObIAllocator &allocator,
   if (OB_FAIL(endpoint_info.get_unencrypted_access_key(allocator, unencrypted_access_key))) {
   } else if (ObAIFuncUtils::is_completion_type(&info)) {
     ObAIFuncIComplete *complete_provider = nullptr;
-    if (OB_FAIL(get_complete_provider(allocator, endpoint_info.get_provider(), complete_provider))) {
+    if (OB_FAIL(get_complete_provider(allocator, endpoint_info, complete_provider))) {
     } else if (OB_FAIL(complete_provider->get_header(allocator, unencrypted_access_key, headers))) {
     }
   } else if (ObAIFuncUtils::is_dense_embedding_type(&info)) {
     ObAIFuncIEmbed *embed_provider = nullptr;
-    if (OB_FAIL(get_embed_provider(allocator, endpoint_info.get_provider(), embed_provider))) {
+    if (OB_FAIL(get_embed_provider(allocator, endpoint_info, embed_provider))) {
     } else if (OB_FAIL(embed_provider->get_header(allocator, unencrypted_access_key, headers))) {
     }
   } else if (ObAIFuncUtils::is_rerank_type(&info)) {
     ObAIFuncIRerank *rerank_provider = nullptr;
-    if (OB_FAIL(get_rerank_provider(allocator, endpoint_info.get_provider(), rerank_provider))) {
+    if (OB_FAIL(get_rerank_provider(allocator, endpoint_info, rerank_provider))) {
     } else if (OB_FAIL(rerank_provider->get_header(allocator, unencrypted_access_key, headers))) {
     }
   }
@@ -914,7 +949,7 @@ int ObAIFuncUtils::get_complete_body(ObIAllocator &allocator,
   }
 
   ObAIFuncIComplete *complete_provider = nullptr;
-  if (OB_FAIL(get_complete_provider(allocator, endpoint_info.get_provider(), complete_provider))) {
+  if (OB_FAIL(get_complete_provider(allocator, endpoint_info, complete_provider))) {
   } else if (OB_FAIL(complete_provider->get_body(allocator, request_model_name, prompt, content, config, body))) {
   }
   return ret;
@@ -944,7 +979,7 @@ int ObAIFuncUtils::get_embed_body(ObIAllocator &allocator,
   }
 
   ObAIFuncIEmbed *embed_provider = nullptr;
-  if (OB_FAIL(get_embed_provider(allocator, endpoint_info.get_provider(), embed_provider))) {
+  if (OB_FAIL(get_embed_provider(allocator, endpoint_info, embed_provider))) {
   } else if (OB_FAIL(embed_provider->get_body(allocator, request_model_name, contents, config, body))) {
   }
   return ret;
@@ -965,7 +1000,7 @@ int ObAIFuncUtils::get_rerank_body(ObIAllocator &allocator,
   }
 
   ObAIFuncIRerank *rerank_provider = nullptr;
-  if (OB_FAIL(get_rerank_provider(allocator, endpoint_info.get_provider(), rerank_provider))) {
+  if (OB_FAIL(get_rerank_provider(allocator, endpoint_info, rerank_provider))) {
   } else if (OB_FAIL(rerank_provider->get_body(allocator, request_model_name, query, document_array, config, body))) {
   }
   return ret;
@@ -978,7 +1013,7 @@ int ObAIFuncUtils::parse_complete_output(ObIAllocator &allocator,
 {
   int ret = OB_SUCCESS;
   ObAIFuncIComplete *complete_provider = nullptr;
-  if (OB_FAIL(get_complete_provider(allocator, endpoint_info.get_provider(), complete_provider))) {
+  if (OB_FAIL(get_complete_provider(allocator, endpoint_info, complete_provider))) {
   } else if (OB_FAIL(complete_provider->parse_output(allocator, http_response, result))) {
   }
   return ret;
@@ -991,7 +1026,7 @@ int ObAIFuncUtils::parse_embed_output(ObIAllocator &allocator,
 {
   int ret = OB_SUCCESS;
   ObAIFuncIEmbed *embed_provider = nullptr;
-  if (OB_FAIL(get_embed_provider(allocator, endpoint_info.get_provider(), embed_provider))) {
+  if (OB_FAIL(get_embed_provider(allocator, endpoint_info, embed_provider))) {
   } else if (OB_FAIL(embed_provider->parse_output(allocator, http_response, result))) {
   }
   return ret;
@@ -1004,7 +1039,7 @@ int ObAIFuncUtils::parse_rerank_output(ObIAllocator &allocator,
 {
   int ret = OB_SUCCESS;
   ObAIFuncIRerank *rerank_provider = nullptr;
-  if (OB_FAIL(get_rerank_provider(allocator, endpoint_info.get_provider(), rerank_provider))) {
+  if (OB_FAIL(get_rerank_provider(allocator, endpoint_info, rerank_provider))) {
   } else if (OB_FAIL(rerank_provider->parse_output(allocator, http_response, result))) {
   }
   return ret;
@@ -1267,6 +1302,23 @@ int ObAIFuncUtils::get_embed_provider(ObIAllocator &allocator, const ObString &p
   return ret;
 }
 
+#define DEFINE_ENDPOINT_PROVIDER_GETTER(func, provider_type)                                   \
+int ObAIFuncUtils::func(ObIAllocator &allocator,                                               \
+                        const share::ObAiModelEndpointInfo &endpoint_info,                     \
+                        provider_type *&provider)                                              \
+{                                                                                              \
+  int ret = OB_SUCCESS;                                                                        \
+  if (OB_FAIL(func(allocator, endpoint_info.get_provider(), provider))) {                      \
+  } else {                                                                                     \
+    provider->set_request_url(endpoint_info.get_url());                                        \
+  }                                                                                            \
+  return ret;                                                                                  \
+}
+DEFINE_ENDPOINT_PROVIDER_GETTER(get_complete_provider, ObAIFuncIComplete)
+DEFINE_ENDPOINT_PROVIDER_GETTER(get_embed_provider, ObAIFuncIEmbed)
+DEFINE_ENDPOINT_PROVIDER_GETTER(get_rerank_provider, ObAIFuncIRerank)
+#undef DEFINE_ENDPOINT_PROVIDER_GETTER
+
 int ObAIFuncUtils::get_rerank_provider(ObIAllocator &allocator, const ObString &provider, ObAIFuncIRerank *&rerank_provider)
 {
   int ret = OB_SUCCESS;
@@ -1506,7 +1558,7 @@ int ObAIFuncModel::call_completion(ObString &prompt, ObJsonObject *config, ObStr
   if (!is_completion_type()) {
     ret = OB_INVALID_ARGUMENT;
     LOG_USER_ERROR(OB_INVALID_ARGUMENT, "ai_complete, info type is not completion");
-  } else if (OB_FAIL(ObAIFuncUtils::get_complete_provider(*allocator_, endpoint_info_.get_provider(), complete_provider))) {
+  } else if (OB_FAIL(ObAIFuncUtils::get_complete_provider(*allocator_, endpoint_info_, complete_provider))) {
   } else if (OB_FAIL(endpoint_info_.get_unencrypted_access_key(*allocator_, unencrypted_access_key))) {
   } else if (OB_FAIL(complete_provider->get_header(*allocator_, unencrypted_access_key, headers))) {
   } else if (OB_FAIL(complete_provider->get_body(*allocator_, request_model_name, prompt_str, prompt, config, body))) {
@@ -1548,7 +1600,7 @@ int ObAIFuncModel::call_completion_vector(ObArray<ObString> &prompts, ObJsonObje
   if (!is_completion_type()) {
     ret = OB_INVALID_ARGUMENT;
     LOG_USER_ERROR(OB_INVALID_ARGUMENT, "ai_complete, info type is not completion");
-  } else if (OB_FAIL(ObAIFuncUtils::get_complete_provider(*allocator_, endpoint_info_.get_provider(), complete_provider))) {
+  } else if (OB_FAIL(ObAIFuncUtils::get_complete_provider(*allocator_, endpoint_info_, complete_provider))) {
   } else if (OB_FAIL(endpoint_info_.get_unencrypted_access_key(*allocator_, unencrypted_access_key))) {
   } else if (OB_FAIL(complete_provider->get_header(*allocator_, unencrypted_access_key, headers))) {
   } else {
@@ -1612,7 +1664,7 @@ int ObAIFuncModel::call_dense_embedding_vector(ObArray<ObString> &contents, ObJs
   if (!is_dense_embedding_type()) {
     ret = OB_INVALID_ARGUMENT;
     LOG_USER_ERROR(OB_INVALID_ARGUMENT, "ai_embed, info type is not dense embedding");
-  } else if (OB_FAIL(ObAIFuncUtils::get_embed_provider(*allocator_, endpoint_info_.get_provider(), embed_provider))) {
+  } else if (OB_FAIL(ObAIFuncUtils::get_embed_provider(*allocator_, endpoint_info_, embed_provider))) {
   } else if (OB_FAIL(endpoint_info_.get_unencrypted_access_key(*allocator_, unencrypted_access_key))) {
   } else if (OB_FAIL(embed_provider->get_header(*allocator_, unencrypted_access_key, headers))) {
   } else {
@@ -1670,7 +1722,7 @@ int ObAIFuncModel::call_dense_embedding_vector_v2(ObArray<ObString> &content, Ob
   if (!is_dense_embedding_type()) {
     ret = OB_INVALID_ARGUMENT;
     LOG_USER_ERROR(OB_INVALID_ARGUMENT, "ai_embed, info type is not dense embedding");
-  } else if (OB_FAIL(ObAIFuncUtils::get_embed_provider(*allocator_, endpoint_info_.get_provider(), embed_provider))) {
+  } else if (OB_FAIL(ObAIFuncUtils::get_embed_provider(*allocator_, endpoint_info_, embed_provider))) {
   } else if (OB_FAIL(endpoint_info_.get_unencrypted_access_key(*allocator_, unencrypted_access_key))) {
   } else if (OB_FAIL(embed_provider->get_header(*allocator_, unencrypted_access_key, headers))) {
   } else if (OB_FAIL(embed_provider->get_body(*allocator_, request_model_name, content, config, body))) {
@@ -1731,7 +1783,7 @@ int ObAIFuncModel::call_rerank(ObString &query, ObJsonArray *contents, ObJsonArr
   if (!is_rerank_type()) {
     ret = OB_INVALID_ARGUMENT;
     LOG_USER_ERROR(OB_INVALID_ARGUMENT, "ai_rerank, info type is not rerank");
-  } else if (OB_FAIL(ObAIFuncUtils::get_rerank_provider(*allocator_, endpoint_info_.get_provider(), rerank_provider))) {
+  } else if (OB_FAIL(ObAIFuncUtils::get_rerank_provider(*allocator_, endpoint_info_, rerank_provider))) {
   } else if (OB_FAIL(endpoint_info_.get_unencrypted_access_key(*allocator_, unencrypted_access_key))) {
   } else if (OB_FAIL(rerank_provider->get_header(*allocator_, unencrypted_access_key, headers))) {
   } else if (OB_FAIL(rerank_provider->get_body(*allocator_, request_model_name, query, contents, nullptr, body))) {

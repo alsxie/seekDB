@@ -67,6 +67,12 @@ public:
   virtual int parse_output(common::ObIAllocator &allocator,
                            common::ObJsonObject *http_response,
                            common::ObIJsonBase *&result) = 0;
+  // endpoint url the request is sent to; providers whose wire protocol
+  // depends on the API path (e.g. Ollama generate/chat) read it
+  void set_request_url(const common::ObString &url) { request_url_ = url; }
+  const common::ObString &get_request_url() const { return request_url_; }
+protected:
+  common::ObString request_url_;
 private:
   DISALLOW_COPY_AND_ASSIGN(ObAIFuncBase);
 };

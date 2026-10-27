@@ -129,6 +129,9 @@ public:
   static int get_header(common::ObIAllocator &allocator,
                         const common::ObString &api_key,
                         common::ObArray<ObString> &headers);
+  static constexpr const char *CHAT_API_PATH = "/api/chat";
+  // true when the url path ends with the given api path (case insensitive)
+  static bool is_api_path(const common::ObString &url, const char *path);
   // Translate OpenAI style generation parameters to the native Ollama request.
   static int apply_generate_config(common::ObIAllocator &allocator,
                                    common::ObJsonObject *config,
@@ -304,6 +307,13 @@ public:
   static int get_complete_provider(ObIAllocator &allocator, const ObString &provider, ObAIFuncIComplete *&complete_provider);
   static int get_embed_provider(ObIAllocator &allocator, const ObString &provider, ObAIFuncIEmbed *&embed_provider);
   static int get_rerank_provider(ObIAllocator &allocator, const ObString &provider, ObAIFuncIRerank *&rerank_provider);
+  // same as above and binds the endpoint url to the provider
+  static int get_complete_provider(ObIAllocator &allocator, const share::ObAiModelEndpointInfo &endpoint_info,
+                                   ObAIFuncIComplete *&complete_provider);
+  static int get_embed_provider(ObIAllocator &allocator, const share::ObAiModelEndpointInfo &endpoint_info,
+                                ObAIFuncIEmbed *&embed_provider);
+  static int get_rerank_provider(ObIAllocator &allocator, const share::ObAiModelEndpointInfo &endpoint_info,
+                                 ObAIFuncIRerank *&rerank_provider);
   static int get_header(ObIAllocator &allocator,
                         const ObAIFuncExprInfo &info,
                         const share::ObAiModelEndpointInfo &endpoint_info,
