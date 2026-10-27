@@ -30,14 +30,22 @@ namespace share
 {
 const ObString ObAiModelEndpointInfo::DEFAULT_SCOPE = "ALL";
 
-const char *VALID_PROVIDERS[] = {
-  "ALIYUN-OPENAI",
-  "ALIYUN-DASHSCOPE",
-  "DEEPSEEK",
-  "SILICONFLOW",
-  "COHERE",
-  "HUNYUAN-OPENAI",
-  "OPENAI"
+struct ObAiProviderTrait
+{
+  const char *name_;
+  // Local runtimes such as Ollama serve requests without authentication.
+  bool access_key_required_;
+};
+
+const ObAiProviderTrait VALID_PROVIDERS[] = {
+  {"ALIYUN-OPENAI", true},
+  {"ALIYUN-DASHSCOPE", true},
+  {"DEEPSEEK", true},
+  {"SILICONFLOW", true},
+  {"COHERE", true},
+  {"HUNYUAN-OPENAI", true},
+  {"OPENAI", true},
+  {"OLLAMA", false}
 };
 
 #define EXTRACT_JSON_ELEM_STR(json_key, member) \
@@ -90,6 +98,8 @@ int ObAiModelEndpointInfo::deep_copy(
   } else if (OB_FAIL(ob_write_string(allocator, other.parameters_, parameters_))) {
   } else if (OB_FAIL(ob_write_string(allocator, other.request_transform_fn_, request_transform_fn_))) {
   } else if (OB_FAIL(ob_write_string(allocator, other.response_transform_fn_, response_transform_fn_))) {
+  } else {
+    max_concurrency_ = other.max_concurrency_;
   }
   return ret;
 }
@@ -112,16 +122,20 @@ int ObAiModelEndpointInfo::check_valid() const
   } else if (url_.empty()) {
     ret = OB_AI_FUNC_PARAM_EMPTY;
     LOG_USER_ERROR(OB_AI_FUNC_PARAM_EMPTY, strlen("url"), "url");
-  } else if (access_key_.empty()) {
-    ret = OB_AI_FUNC_PARAM_EMPTY;
-    LOG_USER_ERROR(OB_AI_FUNC_PARAM_EMPTY, strlen("access_key"), "access_key");
-    LOG_WARN("access_key is empty", K(ret), K(*this));
   } else if (provider_.empty()) {
     ret = OB_AI_FUNC_PARAM_EMPTY;
     LOG_USER_ERROR(OB_AI_FUNC_PARAM_EMPTY, strlen("provider"), "provider");
   } else if (!is_valid_provider(provider_)) {
     ret = OB_AI_FUNC_PARAM_VALUE_INVALID;
     LOG_USER_ERROR(OB_AI_FUNC_PARAM_VALUE_INVALID, strlen("provider"), "provider");
+  } else if (access_key_.empty() && is_access_key_required(provider_)) {
+    ret = OB_AI_FUNC_PARAM_EMPTY;
+    LOG_USER_ERROR(OB_AI_FUNC_PARAM_EMPTY, strlen("access_key"), "access_key");
+    LOG_WARN("access_key is empty", K(ret), K(*this));
+  } else if (has_max_concurrency()
+             && (max_concurrency_ < MIN_MAX_CONCURRENCY || max_concurrency_ > MAX_MAX_CONCURRENCY)) {
+    ret = OB_AI_FUNC_PARAM_VALUE_INVALID;
+    LOG_USER_ERROR(OB_AI_FUNC_PARAM_VALUE_INVALID, strlen("max_concurrency"), "max_concurrency");
   } else if (!parameters_.empty()) {
     ret = OB_AI_FUNC_PARAM_VALUE_INVALID;
     LOG_USER_ERROR(OB_AI_FUNC_PARAM_VALUE_INVALID, strlen("parameters"), "parameters");
@@ -139,12 +153,49 @@ bool ObAiModelEndpointInfo::is_valid_provider(const ObString &provider)
 {
   bool is_valid = false;
   for (int i = 0; i < ARRAYSIZEOF(VALID_PROVIDERS); i++) {
-    if (provider.case_compare(VALID_PROVIDERS[i]) == 0) {
+    if (provider.case_compare(VALID_PROVIDERS[i].name_) == 0) {
       is_valid = true;
       break;
     }
   }
   return is_valid;
+}
+
+bool ObAiModelEndpointInfo::is_access_key_required(const ObString &provider)
+{
+  // unknown providers are rejected by is_valid_provider, keep them strict here
+  bool required = true;
+  for (int i = 0; i < ARRAYSIZEOF(VALID_PROVIDERS); i++) {
+    if (provider.case_compare(VALID_PROVIDERS[i].name_) == 0) {
+      required = VALID_PROVIDERS[i].access_key_required_;
+      break;
+    }
+  }
+  return required;
+}
+
+int ObAiModelEndpointInfo::parse_max_concurrency_(const ObIJsonBase &value)
+{
+  int ret = OB_SUCCESS;
+  int64_t concurrency = UNSPECIFIED_MAX_CONCURRENCY;
+  if (value.json_type() == ObJsonNodeType::J_INT) {
+    concurrency = value.get_int();
+  } else if (value.json_type() == ObJsonNodeType::J_UINT
+             && value.get_uint() <= static_cast<uint64_t>(MAX_MAX_CONCURRENCY)) {
+    concurrency = static_cast<int64_t>(value.get_uint());
+  } else {
+    ret = OB_AI_FUNC_PARAM_VALUE_INVALID;
+  }
+  if (OB_SUCC(ret) && (concurrency < MIN_MAX_CONCURRENCY || concurrency > MAX_MAX_CONCURRENCY)) {
+    ret = OB_AI_FUNC_PARAM_VALUE_INVALID;
+  }
+  if (OB_FAIL(ret)) {
+    LOG_USER_ERROR(OB_AI_FUNC_PARAM_VALUE_INVALID, strlen("max_concurrency"), "max_concurrency");
+    LOG_WARN("invalid max_concurrency", K(ret), K(value.json_type()));
+  } else {
+    max_concurrency_ = concurrency;
+  }
+  return ret;
 }
 
 int ObAiModelEndpointInfo::merge_delta_endpoint(common::ObArenaAllocator &allocator, const ObIJsonBase &delta_jbase)
@@ -165,6 +216,12 @@ int ObAiModelEndpointInfo::merge_delta_endpoint(common::ObArenaAllocator &alloca
       EXTRACT_JSON_ELEM_STR("parameters", parameters_)
       EXTRACT_JSON_ELEM_STR("request_transform_fn", request_transform_fn_)
       EXTRACT_JSON_ELEM_STR("response_transform_fn", response_transform_fn_)
+      if (elem.first.case_compare("max_concurrency") == 0) {
+        if (OB_ISNULL(elem.second)) {
+          ret = OB_ERR_UNEXPECTED;
+        } else if (OB_FAIL(parse_max_concurrency_(*elem.second))) {
+        }
+      } else
       EXTRACT_JSON_ELEM_END()
     }
     iter.next();

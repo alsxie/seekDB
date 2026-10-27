@@ -42,23 +42,36 @@ public:
   virtual bool need_rt_ctx() const override { return true; }
  
 private:
-  static int inner_eval_ai_rerank(common::ObIAllocator &allocator, 
-                                  const common::ObAIFuncExprInfo &info, 
-                                  const share::ObAiModelEndpointInfo &endpoint_info,
-                                  common::ObArray<common::ObString> &header_array, 
-                                  common::ObString &query, 
-                                  common::ObJsonArray *document_array, 
-                                  common::ObJsonArray *&result_array);
-  
-  static int eval_ai_rerank_with_doc_key(const ObExpr &expr, ObEvalCtx &ctx, common::ObIAllocator &allocator,
-                                         common::ObString &model_id, common::ObString &query, common::ObJsonArray *document_array,
-                                         common::ObString &doc_key, const common::ObAIFuncExprInfo &info, const share::ObAiModelEndpointInfo &endpoint_info, ObDatum &res);
+  struct RerankItem
+  {
+    RerankItem() : index_(0), score_(0) {}
+    RerankItem(const int64_t index, const double score) : index_(index), score_(score) {}
+    // higher score first, ties keep the original document order
+    bool operator<(const RerankItem &other) const
+    {
+      return score_ > other.score_ || (score_ == other.score_ && index_ < other.index_);
+    }
+    TO_STRING_KV(K_(index), K_(score));
+    int64_t index_;
+    double score_;
+  };
+  static int get_doc_key(const ObExpr &expr, ObEvalCtx &ctx, MultimodeAlloctor &allocator,
+                         const ObDatum *arg_doc_key, bool &has_doc_key, common::ObString &doc_key);
+  static int check_documents(common::ObJsonArray *document_array, const bool has_doc_key);
   static int get_doc_array_from_documents_array_with_key(ObIAllocator &allocator, ObJsonArray *document_object_array, ObString &doc_key, ObJsonArray *&doc_array);
-  static int sort_document_array_by_model_result(common::ObIAllocator &allocator, common::ObJsonArray *document_array, common::ObJsonArray *model_result_array, common::ObJsonArray *&sorted_document_array);
+  // calls the provider in batches and returns one validated item per document
+  static int rerank_in_batches(common::ObIAllocator &allocator, const common::ObAIFuncExprInfo &info,
+                               const share::ObAiModelEndpointInfo &endpoint_info, common::ObString &query,
+                               common::ObJsonArray *texts, common::ObIArray<RerankItem> &items);
+  static int collect_batch_result(common::ObJsonArray *batch_result, const int64_t base_idx,
+                                  const int64_t batch_cnt, common::ObIArray<bool> &seen,
+                                  common::ObIArray<RerankItem> &items);
+  static int build_result(common::ObIAllocator &allocator, common::ObJsonArray *document_array,
+                          const bool has_doc_key, const common::ObIArray<RerankItem> &items,
+                          common::ObJsonArray *&result);
   static int construct_config_json(common::ObIAllocator &allocator, int64_t top_k, int64_t return_doc, common::ObJsonObject *&config_json);
   static int construct_batch_document_array(common::ObIAllocator &allocator, common::ObJsonArray *document_array, int64_t start_idx, int64_t end_idx, common::ObJsonArray *&batch_document_array);
-  static int batch_result_add_base(common::ObIAllocator &allocator, common::ObJsonArray *array, int64_t start_idx);
-  static int compact_json_array_by_key(common::ObIAllocator &allocator, common::ObJsonArray *array1, common::ObJsonArray *array2, common::ObString &score_key, common::ObJsonArray *&compact_array);
+  static constexpr int64_t MAX_BATCH_DOCS = 20;
   static constexpr int MODEL_IDX = 0;
   static constexpr int QUERY_IDX = 1;
   static constexpr int DOCUMENTS_IDX = 2;

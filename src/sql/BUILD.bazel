@@ -205,6 +205,15 @@ cc_library(
     visibility = ["//src/sql:__subpackages__"],
 )
 
+# Test-only seam for AI function protocol unit tests.
+cc_library(
+    name = "ai_func_test_headers",
+    testonly = True,
+    deps = [":sql_runtime_internal_headers"] + SQL_RUNTIME_NATIVE_DEPS,
+    tags = ["manual"],
+    visibility = ["//unittest/sql/engine/expr:__pkg__"],
+)
+
 _SQL_RUNTIME_UNITY_GROUPS = groups_without(
     SQL_UNITY_GROUPS,
     OPTIMIZER_GROUP_NAMES,

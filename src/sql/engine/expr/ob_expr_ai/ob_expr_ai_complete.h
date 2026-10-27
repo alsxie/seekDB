@@ -42,6 +42,8 @@ public:
                       ObExpr &rt_expr) const override;
   virtual bool need_rt_ctx() const override { return true; }
 private:
+  static int get_config_object(const ObExpr &expr, ObEvalCtx &ctx,
+                               MultimodeAlloctor &allocator, common::ObJsonObject *&config);
   static constexpr int MODEL_IDX = 0;
   static constexpr int PROMPT_IDX = 1;
   static constexpr int CONFIG_IDX = 2;
