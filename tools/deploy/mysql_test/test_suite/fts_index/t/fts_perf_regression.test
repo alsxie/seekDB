@@ -4,7 +4,9 @@
 #   (parallel index build, binary doc id compare, relevance skip for bare MATCH filters,
 #    sorted range dict / charset fast paths used by IK, utf8mb4 general_ci prefix skip,
 #    unobserved LIMIT views without relevance order, memoized tokenize properties,
-#    unscored posting-list merge, inverted-table-only build parallelism).
+#    unscored posting-list merge, inverted-table-only build parallelism, IK per-character dictionary
+#    index, sorted arbitrator chains, lock-free stopword lookup, single-probe word grouping,
+#    sort comparator / string-diff batch decode / collation fast paths).
 # 作者：FDE WorkMate
 
 --disable_warnings
@@ -105,6 +107,72 @@ select 'abcdef' = 'ABCDEF', 'abcdef' < 'abcdeg', 'abc' = 'abc   ', 'résumé' = 
        'OceanBase全文' = 'oceanbase全文', 'OceanBase全文' < 'OceanBase全斗', 'ab' < 'abc',
        strcmp('前缀相同后缀a', '前缀相同后缀B'), strcmp('xyz', 'xyz') from dual;
 select count(distinct tag) from docs where tag in ('alpha', 'beta');
+
+# IK dictionary lookups go through a per-character code index of the double-array trie: BMP and
+# supplementary CJK, full-width forms, kana, hangul, emoji, letters, digits, connectors and
+# ambiguous segmentations (arbitrator chains) must segment exactly as before in both modes
+select tokenize('研究生命起源 结婚的和尚未结婚的 南京市长江大桥 乒乓球拍卖完了 工信处女干事每月经过下属科室', 'ik');
+select tokenize('研究生命起源 结婚的和尚未结婚的 南京市长江大桥 乒乓球拍卖完了 工信处女干事每月经过下属科室', 'ik', '[{"additional_args":[{"ik_mode":"max_word"}]}]');
+select tokenize('ＯｃｅａｎＢａｓｅ２０２４ 全角ＡＢＣ１２３ ｶﾀｶﾅ ひらがな カタカナ 한국어 텍스트', 'ik');
+select tokenize('ＯｃｅａｎＢａｓｅ２０２４ 全角ＡＢＣ１２３ ｶﾀｶﾅ ひらがな カタカナ 한국어 텍스트', 'ik', '[{"additional_args":[{"ik_mode":"max_word"}]}]');
+select tokenize('𠀀𠀁𪚥 😀👍 emoji混排😀中文 ①②③ ㈠㈡ Ⅻ年', 'ik');
+select tokenize('iPhone15ProMax COVID-19 3.14159 1,000,000 user@example.com http://www.example.com/a?b=1 v1.2.3 C++ x86_64', 'ik');
+select tokenize('iPhone15ProMax COVID-19 3.14159 1,000,000 user@example.com http://www.example.com/a?b=1 v1.2.3 C++ x86_64', 'ik', '[{"additional_args":[{"ik_mode":"max_word"}]}]');
+select tokenize('二〇二四年十二月三十一日 第三百五十六号 五点五公斤 七八十个 两千零一十 三分之一 百分之五十', 'ik');
+select tokenize('二〇二四年十二月三十一日 第三百五十六号 五点五公斤 七八十个 两千零一十 三分之一 百分之五十', 'ik', '[{"additional_args":[{"ik_mode":"max_word"}]}]');
+
+# stopword lookups and words that differ only in case or accents: grouped under utf8mb4_general_ci
+# with their counts, the reported form of a group is unchanged
+select tokenize('The the THE a an of AND and In is IS it to To be', 'beng');
+select tokenize('The the THE a an of AND and In is IS it to To be', 'space');
+select tokenize('The the THE a an of AND and In is IS it to To be', 'ik');
+select tokenize('Apple apple APPLE ApPlE café CAFE Café cafe', 'beng', '[{"output": "all"}]');
+select tokenize('Apple apple APPLE ApPlE café CAFE Café cafe', 'space', '[{"output": "all"}]');
+select tokenize('Apple apple APPLE ApPlE café CAFE Café cafe 苹果 苹果 数据库 数据 数据库', 'ik', '[{"output": "all"}]');
+select tokenize('数据 数据库 DATA data Data 数据库系统', 'ngram', '[{"output": "all"}]');
+
+# index build over words that collide under utf8mb4_general_ci (sorted by word, then doc id) and
+# over string keys with long shared prefixes (string-diff encoded in the built index)
+create table words(
+  id int primary key,
+  w varchar(64),
+  b varbinary(64),
+  body varchar(512)) default charset utf8mb4 collate utf8mb4_general_ci;
+--disable_query_log
+let $i = 1;
+while ($i <= 300)
+{
+  let $m = `select $i % 6`;
+  if ($m == 0) { eval insert into words values($i, 'Résumé', unhex(lpad(hex($i), 16, '0')), 'Résumé resume RESUME résumé shared_prefix_term_$i'); }
+  if ($m == 1) { eval insert into words values($i, 'resume', unhex(lpad(hex($i), 16, 'A')), 'resume Resume 数据库 shared_prefix_term_$i'); }
+  if ($m == 2) { eval insert into words values($i, 'RESUME ', null, 'Straße STRASSE strasse 数据库系统 shared_prefix_term_$i'); }
+  if ($m == 3) { eval insert into words values($i, concat('shared_prefix_term_', lpad($i, 6, '0')), unhex(concat('00112233445566', lpad(hex($i), 4, '0'))), 'ÀÁÂ aaa AAA ǅ ǆ Ǆ ß ss'); }
+  if ($m == 4) { eval insert into words values($i, null, unhex(concat('00112233445566', lpad(hex($i), 4, '0'))), ''); }
+  if ($m == 5) { eval insert into words values($i, concat('Shared_Prefix_Term_', lpad($i, 6, '0')), '', 'shared_prefix_term_$i Shared_Prefix_Term_$i'); }
+  inc $i;
+}
+--enable_query_log
+create fulltext index ft_words on words(body) with parser beng;
+create fulltext index ft_words_ik on words(w, body) with parser ik;
+create index idx_w_b on words(w, b);
+create index idx_b_w on words(b, w);
+select count(*), sum(id) from words where match(body) against('resume');
+select count(*), sum(id) from words where match(body) against('RÉSUMÉ');
+select count(*), sum(id) from words where match(body) against('strasse');
+select count(*), sum(id) from words where match(body) against('aaa ss');
+select count(*), sum(id) from words where match(body) against('shared_prefix_term_17 shared_prefix_term_299');
+select count(*), sum(id) from words where match(w, body) against('数据库 resume');
+select count(*), sum(id) from words where match(w, body) against('数据库系统');
+select id from words where match(body) against('resume strasse') order by id limit 7;
+select /*+ index(words idx_w_b) */ id, w, hex(b) from words where w >= 'shared' order by w, b, id limit 12;
+select /*+ index(words idx_w_b) */ count(*), count(w), count(b), sum(id) from words where w = 'resume';
+select /*+ index(words idx_b_w) */ id, hex(b), w from words where b > unhex('0011223344556600') order by b, w, id limit 12;
+select /*+ index(words idx_b_w) */ count(*), sum(id) from words where b is null;
+select count(*), count(w), count(distinct w), count(distinct b) from words;
+select count(*) from (select w from words group by w) g;
+select id from words order by w desc, b, id limit 10;
+select id from words order by b desc, w, id desc limit 10;
+drop table words;
 
 drop table docs;
 drop database fts_perf_reg;

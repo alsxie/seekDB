@@ -126,7 +126,7 @@ int ObIKArbitrator::output_result(TokenizeContext &ctx)
                                                          type))) {
     } else if (ObFTCharUtil::CharType::USELESS == type) {
       current += char_len; // skip useless char
-    } else if (OB_FAIL(chains_.get_refactored(current, chain)) && OB_HASH_NOT_EXIST != ret) {
+    } else if (OB_FAIL(get_chain(current, chain)) && OB_HASH_NOT_EXIST != ret) {
     } else if (OB_HASH_NOT_EXIST == ret) {
       ret = OB_SUCCESS;
       if (!keep_single()) {
@@ -300,16 +300,39 @@ int ObIKArbitrator::remove_conflict(const ObIKToken &token, ObIKTokenChain *opti
 
 int ObIKArbitrator::prepare(TokenizeContext &ctx)
 {
-  int ret = OB_SUCCESS;
+  UNUSED(ctx);
+  chains_.reuse();
+  return OB_SUCCESS;
+}
 
-  int cal_bucket_num = MAX(ctx.fulltext_len() / 100, 10);
-  cal_bucket_num = MIN(cal_bucket_num, 100);
-  if (OB_FAIL(chains_.create(cal_bucket_num, ObMemAttr("IK ARBITRATE")))) {
+ObIKArbitrator::ObIKArbitrator() : alloc_(lib::ObMemAttr("IK Arbitrator")), chains_() {}
+
+int64_t ObIKArbitrator::lower_bound(const int64_t offset) const
+{
+  const ChainEntry *entries = chains_.get_data();
+  int64_t lo = 0;
+  int64_t hi = chains_.count();
+  while (lo < hi) {
+    const int64_t mid = lo + (hi - lo) / 2;
+    if (entries[mid].offset_ < offset) {
+      lo = mid + 1;
+    } else {
+      hi = mid;
+    }
+  }
+  return lo;
+}
+
+int ObIKArbitrator::get_chain(const int64_t offset, ObIKTokenChain *&chain) const
+{
+  int ret = OB_HASH_NOT_EXIST;
+  const int64_t pos = lower_bound(offset);
+  if (pos < chains_.count() && chains_.get_data()[pos].offset_ == offset) {
+    chain = chains_.get_data()[pos].chain_;
+    ret = OB_SUCCESS;
   }
   return ret;
 }
-
-ObIKArbitrator::ObIKArbitrator() : alloc_(lib::ObMemAttr("IK Arbitrator")) {}
 
 int ObIKArbitrator::add_chain(ObIKTokenChain *chain)
 {
@@ -318,7 +341,28 @@ int ObIKArbitrator::add_chain(ObIKTokenChain *chain)
     ret = OB_INVALID_ARGUMENT;
   } else if (chain->list().is_empty()) {
     // no need to add empty chain
-  } else if (OB_FAIL(chains_.set_refactored(chain->min_offset(), chain))) {
+  } else {
+    ChainEntry entry;
+    entry.offset_ = chain->min_offset();
+    entry.chain_ = chain;
+    const int64_t cnt = chains_.count();
+    if (0 == cnt || chains_.get_data()[cnt - 1].offset_ < entry.offset_) {
+      // the usual case: chains come in increasing offset order
+      ret = chains_.push_back(entry);
+    } else {
+      const int64_t pos = lower_bound(entry.offset_);
+      if (pos < cnt && chains_.get_data()[pos].offset_ == entry.offset_) {
+        ret = OB_HASH_EXIST; // same as the hash map without overwrite
+      } else if (OB_FAIL(chains_.push_back(entry))) {
+      } else {
+        // move the new entry back to its sorted position
+        ChainEntry *entries = chains_.get_data();
+        for (int64_t i = cnt; i > pos; --i) {
+          entries[i] = entries[i - 1];
+        }
+        entries[pos] = entry;
+      }
+    }
   }
   return ret;
 }

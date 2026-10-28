@@ -33,6 +33,82 @@ namespace oceanbase
 {
 namespace storage
 {
+/* @class ObFTCharCodeIndex
+ * @description: read-only index from a single character to its code, built once after the DAT is
+ *   finished.  A key packs the character bytes and the length into one integer, the table has a
+ *   power of two capacity with at most 50% load, so a lookup is one multiplication and usually one
+ *   probe into a small, dense table.  Characters longer than MAX_KEY_LEN bytes are not indexed and
+ *   stay on ObArrayHashMap.  作者：FDE WorkMate
+ */
+struct ObFTCharCodeIndex final
+{
+public:
+  struct Entry
+  {
+    uint32_t key_; // 0 means empty
+    ObFTWordCode code_;
+  } __attribute__((packed));
+
+  static constexpr int64_t MAX_KEY_LEN = 3;
+  static constexpr uint32_t MIN_BITS = 4;
+
+  static OB_INLINE bool is_indexable(const int64_t len) { return len > 0 && len <= MAX_KEY_LEN; }
+
+  // Only valid when is_indexable(len). The length byte keeps keys of different lengths apart and
+  // makes every key non zero.
+  static OB_INLINE uint32_t make_key(const char *ptr, const int64_t len)
+  {
+    const unsigned char *p = reinterpret_cast<const unsigned char *>(ptr);
+    uint32_t key = (static_cast<uint32_t>(len) << 24) | static_cast<uint32_t>(p[0]);
+    if (len > 1) {
+      key |= static_cast<uint32_t>(p[1]) << 8;
+    }
+    if (len > 2) {
+      key |= static_cast<uint32_t>(p[2]) << 16;
+    }
+    return key;
+  }
+
+  static uint32_t estimate_bits(const uint64_t key_count);
+  static size_t estimate_size(const uint32_t bits);
+
+  void init(const uint32_t bits);
+  // no duplicate should be inserted
+  void insert(const uint32_t key, const ObFTWordCode code);
+
+  OB_INLINE bool find(const uint32_t key, ObFTWordCode &code) const
+  {
+    bool found = false;
+    const uint32_t mask = (1U << bits_) - 1;
+    uint32_t pos = slot(key);
+    // load factor <= 50%, an empty slot always ends the probe
+    while (true) {
+      const Entry &entry = entries_[pos];
+      if (entry.key_ == key) {
+        code = entry.code_;
+        found = true;
+        break;
+      } else if (0 == entry.key_) {
+        break;
+      } else {
+        pos = (pos + 1) & mask;
+      }
+    }
+    return found;
+  }
+
+private:
+  OB_INLINE uint32_t slot(const uint32_t key) const
+  {
+    return static_cast<uint32_t>(key * 2654435769U) >> (32 - bits_);
+  }
+
+public:
+  uint32_t bits_;
+  uint32_t count_;
+  Entry entries_[1];
+} __attribute__((packed));
+
 /* @class ObArrayHashMap
  * @description: a fixed size hash map, used to store words and their code.
  */
@@ -68,6 +144,11 @@ public:
   int find(const ObFTSingleWord &word, ObFTWordCode &code) const;
   int find(const ObString &key, ObFTWordCode &code) const;
 
+  uint32_t count() const { return header_.count_; }
+  // number of words that can be put into an ObFTCharCodeIndex
+  uint64_t indexable_count() const;
+  void fill_char_index(ObFTCharCodeIndex &index) const;
+
 private:
   struct Header header_;
 } __attribute__((packed));
@@ -100,6 +181,8 @@ public:
   size_t data_index_offset_ = 0;
   // use if offset is not 0
   size_t data_offset_ = 0;
+  // offset of the ObFTCharCodeIndex, 0 if there is none (it is always behind the check array)
+  size_t char_index_offset_ = 0;
   // a buffer to store dat
   ObFTSingleWord start_word_;
   ObFTSingleWord end_word_;
@@ -107,6 +190,13 @@ public:
 
 public:
   ObArrayHashMap *get_map();
+  const ObArrayHashMap *get_map() const { return reinterpret_cast<const ObArrayHashMap *>(buff); }
+  const ObFTCharCodeIndex *get_char_index() const
+  {
+    return 0 == char_index_offset_
+               ? nullptr
+               : reinterpret_cast<const ObFTCharCodeIndex *>(buff + char_index_offset_);
+  }
 } __attribute__((packed));
 
 template <typename DataType>
@@ -145,6 +235,9 @@ public:
 
 private:
   int expand();
+
+  // Append an ObFTCharCodeIndex of all indexable characters behind the check array.
+  int build_char_index();
 
   int encode(const ObString &word, ObFTWordCode &code, bool add);
 

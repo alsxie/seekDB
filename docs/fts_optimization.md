@@ -12,7 +12,7 @@
   - B2（容器型）：`docker update --cpus=2`，CFS 配额 2 核，但可见 8 核。
 - 形态校准：两次 CI 实测分别为 4d87a0bd 30.70、f0244d75 40.38；对应仿真为 B2 32.3 / A4 40.3。评测机形态不能唯一确定，所以两种形态都要不退化。
 
-## 结果（最终版本，2026-10-29 校准）
+## 结果（本次 ②，ss144 仿真，2026-10-29 校准）
 
 A4：
 
@@ -57,8 +57,30 @@ B2：
 | 475d8cca | 批量 unscored merge、批量投影、string diff 定长解码 | 46.3 | 41.8 | – |
 | 本次 ① | 构建采样修复 + domain id 点查、排序比较裸指针 | 48.3 | 43.9 | – |
 | 本次 ② | 构建并行度按可用 CPU（配额/亲和性）计算 | 48.5 | 46.6 | – |
+| 本次 ③ | IK 逐字符路径、停用词与词频合并、字符串比较内联（见下节） | – | – | – |
 
 ① 中的采样修复使 A4 构建项由 45.5% 升到 53.0%（同会话对照 475d8cca）；② 只改变受配额限制的形态，A4 持平，B2 构建项由 33.8% 升到 41.2%。
+
+本次 ③ 在 N95（4 核，7.5 GB，governor=performance）上与 ② 同会话交替对照，每次全新实例运行官方脚本，参数与 CI 相同：
+
+| 指标 | 基线 | ② | ③ | ③ 较 ② 耗时变化 |
+|---|---|---|---|---|
+| build_ik_all_sec | 11.758 | 4.983 | 4.865 | -2.4% |
+| build_ik_content_sec | 9.208 | 5.752 | 5.253 | -8.7% |
+| build_beng_en_sec | 4.796 | 2.865 | 2.673 | -6.7% |
+| tokenize_ik_avg_ms | 0.1577 | 0.1313 | 0.1226 | -6.6% |
+| tokenize_beng_avg_ms | 0.0910 | 0.0848 | 0.0813 | -4.1% |
+| query_cn_avg_ms | 2.552 | 0.863 | 0.861 | -0.3% |
+| query_beng_avg_ms | 3.786 | 1.209 | 1.206 | -0.3% |
+| query_mixed_avg_ms | 2.845 | 1.028 | 1.015 | -1.2% |
+| query_limit_avg_ms | 3.354 | 0.340 | 0.341 | 0.4% |
+
+| 形态 | ② 综合（构建/分词/查询） | ③ 综合（构建/分词/查询） |
+|---|---|---|
+| 4 核，2 轮 | 42.96（45.1 / 11.8 / 72.0） | 45.74（48.6 / 16.4 / 72.1） |
+| `taskset` 2 核，1 轮 | 37.72（25.7 / 14.1 / 73.4） | 41.09（28.6 / 20.5 / 74.2） |
+
+③ 只减少单线程 CPU，两种形态都提升约 3 个综合点；N95 与 ss144 的绝对值不同，只比较同机差值。
 
 ## 瓶颈依据与修改点
 
@@ -69,7 +91,9 @@ B2：
 - 采样修复（本次 ①）：PX 先对源表采样来切分各 worker 的范围。倒排表构建的采样扫描走的是未分词的源行，没有 word 和 doc id 值，切出的边界都落在全部真实 key 之前，于是一个 worker 拿到整张倒排表，其他 worker 空转（线程时间线可见单线程独占）。修改 `ObTableScanOp::inner_get_next_row`：FTS DDL 扫描在采样时同样输出分词后的索引行。采样行的 doc id 由 `ObDASDomainIdMergeIter` 对未采样的 rowkey→doc id 表做点查取得（`lookup_sampled_rows_`），原来两张表各自独立采样后逐行合并，行对不上；点查模式下扫描结束不再排空 rowkey 迭代器，个别取不到 doc id 的采样行填空值，只影响切分估计。
 - 排序比较：排序算子 `ObSortOpImpl::Compare`（构建计划中的排序）改为直接访问比较函数与排序列数组（`ObIArray::at()` 带断言，无法内联）。perf 显示 `ObNullSafeDatumStrCmp::cmp` 88% 的自身时间在读取 datum 长度/标志（StoredRow 分散导致缓存缺失），比较器层面的优化上限约为构建 CPU 的 5%，因此只做这一处。
 - utf8mb4_general_ci 比较跳过相同前缀（`ob_ctype_utf8.cc`），`ObCharset::get_charset` 内联快路径：排序键多为长公共前缀的词。
-- 词频表 `ObFTWordMap`（`data_plane/fts/ob_fts_struct.h`）改用 `NoPthreadDefendMode`：每次分词调用独占一张表，无需桶锁；构建与 TOKENIZE 共用这张表。`groupby_word` 仍是查询加写入两次哈希探测，改成单次探测实测无收益，已回退。
+- 词频表 `ObFTWordMap`（`data_plane/fts/ob_fts_struct.h`）改用 `NoPthreadDefendMode`：每次分词调用独占一张表，无需桶锁；构建与 TOKENIZE 共用这张表。
+- 字符串比较（本次 ③）：`ObCharset::is_argument_valid` 失败时带 BACKTRACE 的日志移到 cold、noinline 函数，校验本身足够小，可以内联进 `strcmpsp` 等每次排序比较都要调用的函数（`ob_charset.cpp`）；`ob_strnncollsp_utf8mb4` 跳过公共前缀后若两串字节完全相同直接返回 0，原路径对相同字节同样返回 0（`ob_ctype_utf8.cc`），倒排排序键中同一个词大量重复。
+- 构建扫描侧约 70% 是 IK 分词，下节的逐字符优化同时作用于构建。
 
 ### 分词（TOKENIZE）
 
@@ -80,6 +104,14 @@ B2：
   - 范围词典有序且不重叠时二分查找，重叠时保持原线性首个匹配语义（`ob_ft_range_dict.cpp`）；
   - DAT 字符码查找直接用 key 字节探测（`ob_ft_dat_dict.cpp`）；
   - IK 仲裁器 chain map 去掉线程锁。
+- 本次 ③（perf：tok_ik 每条语句服务端约 45 µs，`tokenize_fulltext` 内 IK 主循环约 57%、DAT `match_with_hit` 约 13.5%、词频合并与停用词约 18%、parser 初始化约 8%）：
+  - DAT 字符码索引（`ob_ft_dat_dict.{h,cpp}`）：DAT 建好后在其后追加只读开放寻址表，键为字符字节与长度打包的 32 位整数，负载不超过 50%，一次乘法哈希、通常一次探测；不超过 3 字节的字符走该表，更长的仍走原 `ObArrayHashMap`，两者收录的字符完全相同。另补上 `base + code` 越界判断（越界即无转移）。
+  - 范围词典按首字符定位子词典的二分查找改为比较打包的 64 位整数键，顺序与 memcmp 加长度一致（`ob_ft_range_dict.{h,cpp}`）。
+  - 字符分类（`ob_ik_char_util.h`）：原实现按字母、阿拉伯数字、中文、其他 CJK、高低代理逐项判断，每项各自解码一次，同一字符最多解码 6 次；改为解码一次后按原顺序判断，代理区只对 UTF-16 判断。中文数字判断由线性扫描码点数组改为 [min, max] 位图（`unicode_utils.cpp`）。
+  - IK 仲裁器（`ob_ik_arbitrator.{h,cpp}`）：链表索引由每批新建的哈希表改为按 min_offset 递增的有序数组加二分查找，重复键仍返回 `OB_HASH_EXIST`。
+  - 停用词（`ob_fts_stop_word.cpp`）：`ObHashSet` 默认模式每次查找都加桶读锁；进程内构建一份同桶数、同插入顺序、无锁模式的只读副本，答案相同。
+  - 词频合并（`ob_fts_parser_helper.cpp`）：`groupby_word` 的 `get` + 覆盖 `set` 两次哈希与桶遍历改为 `set_or_update` 一次，回调与原逻辑一致（条目位置不变、key 换成最新的词、次数累加）。
+  - `ObFTParser::serialize_to_str` 直接拼接 `name.version`，不经过 vsnprintf，空间不足时仍走原报错路径；`ObIKFTParser::init` 按线程记住上一个 charset 对象对应的 collation（`ObCharset::collation_type` 按名称查表，同一对象结果固定）；IK 停用词词典不再加载，`get_next_token()` 中对它的匹配本来就是注释掉的，加载只是每次初始化多 pin 一组缓存（`ob_ik_ft_parser.cpp`）。
 - 剩余空间小：beng 分词 `eval_tokenize` 只占进程采样的 14.3%，`ObMPQuery::process` 48.7%、sql-nio 25%，每条语句服务端约 33 µs、端到端约 67 µs，固定的语句开销占主导；IK 的 DAT 查找约占 10.5%，每项候选优化收益不超过 1 个综合点。
 - 返回类型仍为 JSON，分词规则不变；未做结果缓存（会变成针对测试数据的优化）。
 
@@ -99,16 +131,19 @@ B2：
 - 67090 行 TOKENIZE/MATCH dump（分词结果、命中 id、排序、BM25 分数）与基线逐字节一致；最终版本在全容器形态（3 个 worker）与 A4（2 个 worker）下的 dump 也逐字节一致。
 - 差分模糊测试（collation 比较、TOKENIZE、MATCH 各模式、预编译语句、8 会话并发复现）与上一版本输出一致；与基线相比只有基线自身两次运行间也存在的 BM25 浮点漂移和并列重排。
 - 官方用例集 fts_index、vector_index、ai_function、file_sql、ai_column、ddl、table_redefinition：判定为 mysqltest 退出码 0、生成 .out 且与 .result 一致。失败项与基线二进制完全相同，输出逐字节一致（`basic_dml`、`partitioned_simple_query`、`vector_ivf_index_with_filter`、`dump_ddl_mem`，基线本身即不通过，为 plan 参数编号、内部表 id 等环境差异）。
+- 本次 ③：444 条 TOKENIZE（37 段文本，含中英混合、全角、假名、谚文、emoji、超长词、停用词、大小写与重音，× 12 种 parser / 参数组合）与 2047 行建索引后 MATCH 输出，与基线逐字节一致；fts_index 16 个用例全部通过。
 
 ## 回归用例
 
-`tools/deploy/mysql_test/test_suite/fts_index/t/fts_perf_regression.test` 覆盖：并行构建、过滤式 MATCH 与带分数形式结果一致、unscored merge（含 >8 维回退和不存在的词）、并列 LIMIT 顺序、LIMIT 视图、属性记忆、IK 各模式、general_ci 比较。该用例在基线二进制和优化版上输出逐字节一致。
+`tools/deploy/mysql_test/test_suite/fts_index/t/fts_perf_regression.test` 覆盖：并行构建、过滤式 MATCH 与带分数形式结果一致、unscored merge（含 >8 维回退和不存在的词）、并列 LIMIT 顺序、LIMIT 视图、属性记忆、IK 各模式、general_ci 比较。本次 ③ 新增：IK smart / max_word 下的 CJK、全角、假名、谚文、emoji、歧义切分、数词量词、字母数字混合；beng / space / ik / ngram 的停用词与大小写、重音；general_ci 下相互冲突的词、共享前缀、varbinary、NULL 的排序与计数。该用例在基线二进制和优化版上输出逐字节一致。
 
 ## 已评估未采用
 
 - 编码排序键（DDL 排序在存储层，改动风险高）；
 - 跨调用复用 IK 解析器/词典句柄（KV cache 常驻 pin 与词典失效风险）；
-- DAT 字符码单字符记忆、groupby 单次哈希探测：实测收益不超过噪声，已回退；
+- DAT 字符码单字符记忆：实测收益不超过噪声，已回退（本次 ③ 改为整表字符码索引）；
+- TOKENIZE 结果 JSON 直出：约占分词耗时 2%～4%，需要改共享 JSON 库的头文件；
+- DDL 调度轮询：DDLTaskExecutor 每 10 ms 通过内部 SQL 刷新任务状态，约占构建采样 8.6%，属于 DDL 框架通用行为，关系到取消与失败检测；
 - 修改全局参数默认值（`px_task_size`、工作区比例）与全局 `get_cpu_num()`：影响面超出全文索引；
 - DDL 临时数据压缩、FTS DDL 扫描向量化：影响所有 DDL，收益未经验证。
 

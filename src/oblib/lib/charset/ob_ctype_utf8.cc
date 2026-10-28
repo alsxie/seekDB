@@ -392,6 +392,11 @@ static int ob_strnncollsp_utf8mb4(const ObCharsetInfo *cs,
     while (same < min_len && src[same] == dst[same]) {
       ++same;
     }
+    if (same == srclen && srclen == dstlen) {
+      // byte-identical strings compare equal whatever they contain: the generic path below
+      // returns 0 for them as well (equal weights, or bincmp of equal bytes)
+      return 0;
+    }
     const unsigned char *p = src;
     const unsigned char *pe = src + same;
     while (p < pe) {

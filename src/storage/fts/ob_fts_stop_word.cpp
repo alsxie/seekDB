@@ -27,6 +27,51 @@ namespace oceanbase
 namespace storage
 {
 
+namespace
+{
+// The stop word set never changes after init, but ObHashSet's default defend mode takes a bucket
+// read lock on every lookup.  A second set with the same bucket number, the same words in the same
+// order and NoPthreadDefendMode gives exactly the same answers without the lock.  It is built
+// once per process and never freed (it may be used until exit).  作者：FDE WorkMate
+typedef common::hash::ObHashSet<ObFTWord, common::hash::NoPthreadDefendMode> ObNoLockStopWordSet;
+
+ObNoLockStopWordSet *build_no_lock_stopword_set(const int64_t bucket_num, const ObObjMeta &meta)
+{
+  int ret = OB_SUCCESS;
+  ObNoLockStopWordSet *set = nullptr;
+  void *buf = nullptr;
+  const lib::ObMemAttr attr("StopWordSet");
+  if (OB_ISNULL(buf = ob_malloc(sizeof(ObNoLockStopWordSet), attr))) {
+    ret = OB_ALLOCATE_MEMORY_FAILED;
+    LOG_WARN("fail to alloc no lock stop word set", K(ret));
+  } else if (FALSE_IT(set = new (buf) ObNoLockStopWordSet())) {
+  } else if (OB_FAIL(set->create(bucket_num, "StopWordSet", "StopWordSet"))) {
+    LOG_WARN("fail to create no lock stop word set", K(ret), K(bucket_num));
+  } else {
+    const int64_t stopword_count = sizeof(ob_stop_word_list) / sizeof(ob_stop_word_list[0]);
+    for (int64_t i = 0; OB_SUCC(ret) && i < stopword_count; ++i) {
+      ObFTWord stopword(STRLEN(ob_stop_word_list[i]), ob_stop_word_list[i], meta);
+      if (OB_FAIL(set->set_refactored(stopword))) {
+        LOG_WARN("fail to add stop word", K(ret), K(i));
+      }
+    }
+  }
+  if (OB_FAIL(ret) && OB_NOT_NULL(set)) {
+    set->~ObNoLockStopWordSet();
+    ob_free(buf);
+    set = nullptr;
+  }
+  return set;
+}
+
+// nullptr if it could not be built, the locked set is used then
+const ObNoLockStopWordSet *get_no_lock_stopword_set(const int64_t bucket_num, const ObObjMeta &meta)
+{
+  static const ObNoLockStopWordSet *set = build_no_lock_stopword_set(bucket_num, meta);
+  return set;
+}
+} // namespace
+
 ////////////////////////////////////////////////////////////////////////////////
 // class ObStopWordChecker
 ObStopWordChecker::~ObStopWordChecker()
@@ -92,7 +137,13 @@ int ObStopWordChecker::check_stopword(const ObFTWord &word, bool &is_stopword)
                                        cmp_str))) {
     } else {
       ObFTWord converted(cmp_str.length(), cmp_str.ptr(), stopword_type_);
-      ret = stopword_set_.exist_refactored(converted);
+      const ObNoLockStopWordSet *no_lock_set =
+          get_no_lock_stopword_set(DEFAULT_STOPWORD_BUCKET_NUM, stopword_type_);
+      if (OB_NOT_NULL(no_lock_set)) {
+        ret = no_lock_set->exist_refactored(converted);
+      } else {
+        ret = stopword_set_.exist_refactored(converted);
+      }
       if (OB_HASH_NOT_EXIST == ret) {
         is_stopword = false;
         ret = OB_SUCCESS;
@@ -195,23 +246,36 @@ int ObAddWord::check_stopword(const ObFTWord &ft_word, bool &is_stopword)
   return ret;
 }
 
+namespace
+{
+// Applied to an existing entry: same result as get + set with overwrite, i.e. the entry keeps its
+// place in the bucket, the newest word becomes the key and the count grows by word_freq.
+// 作者：FDE WorkMate
+struct ObFTWordGroupbyOp final
+{
+  ObFTWordGroupbyOp(const ObFTWord &word, const int64_t word_freq) : word_(word), word_freq_(word_freq) {}
+  void operator()(common::hash::HashMapPair<ObFTWord, int64_t> &entry)
+  {
+    entry.first = word_;
+    entry.second += word_freq_;
+  }
+  const ObFTWord &word_;
+  const int64_t word_freq_;
+};
+} // namespace
+
 int ObAddWord::groupby_word(const ObFTWord &word, const int64_t word_freq)
 {
   int ret = OB_SUCCESS;
-  int64_t word_count = 0;
   if (OB_UNLIKELY(word.empty() || word_freq <= 0)) {
     ret = OB_INVALID_ARGUMENT;
   } else if (!flag_.groupby_word()) {
     if (OB_FAIL(word_map_.set_refactored(word, 1/*word count*/))) {
     }
-  } else if (OB_FAIL(word_map_.get_refactored(word, word_count)) && OB_HASH_NOT_EXIST != ret) {
   } else {
-    if (OB_HASH_NOT_EXIST == ret) {
-      word_count = 1;
-    } else {
-      word_count += word_freq;
-    }
-    if (OB_FAIL(word_map_.set_refactored(word, word_count, 1/*overwrite*/))) {
+    // one hash and one bucket walk instead of get + set; a new word starts with count 1
+    ObFTWordGroupbyOp groupby_op(word, word_freq);
+    if (OB_FAIL(word_map_.set_or_update(word, 1/*word count*/, groupby_op))) {
     }
   }
   return ret;

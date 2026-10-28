@@ -183,6 +183,8 @@ int ObFTDATBuilder<DATA_TYPE>::build_from_trie(ObFTTrie<DATA_TYPE> &trie)
       // already logged
     } else if (OB_FAIL(trie.get_start_word(dat_->start_word_))) {
     } else if (OB_FAIL(trie.get_end_word(dat_->end_word_))) {
+    } else if (OB_FAIL(build_char_index())) {
+      LOG_WARN("fail to build char index of dat", K(ret));
     }
     LOG_INFO("build dat finished", K(dat_->start_word_.get_word()), K(dat_->end_word_.get_word()));
 
@@ -224,6 +226,43 @@ int ObFTDATBuilder<DATA_TYPE>::expand()
 }
 
 template <typename DATA_TYPE>
+int ObFTDATBuilder<DATA_TYPE>::build_char_index()
+{
+  int ret = OB_SUCCESS;
+  if (OB_ISNULL(dat_) || OB_ISNULL(map_)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else {
+    const int64_t head_size = dat_->buff - reinterpret_cast<char *>(dat_);
+    // everything in use ends with the check array
+    const int64_t data_size = dat_->check_offset_ + dat_->array_size_ * sizeof(int32_t);
+    // keep the index 8 bytes aligned relative to the block
+    const int64_t index_offset = ((head_size + data_size + 7) & ~static_cast<int64_t>(7)) - head_size;
+    const uint32_t bits = ObFTCharCodeIndex::estimate_bits(map_->indexable_count());
+    const int64_t index_size = ObFTCharCodeIndex::estimate_size(bits);
+    const int64_t buffer_size = head_size + index_offset + index_size;
+    const int64_t copy_size = MIN(head_size + data_size, dat_->mem_block_size_);
+    ObFTDAT *new_dat = nullptr;
+    if (OB_UNLIKELY(copy_size > buffer_size)) {
+      ret = OB_ERR_UNEXPECTED;
+    } else if (OB_ISNULL(new_dat = static_cast<ObFTDAT *>(alloc_.alloc(buffer_size)))) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+    } else {
+      MEMCPY(new_dat, dat_, copy_size);
+      memset(reinterpret_cast<char *>(new_dat) + copy_size, 0, buffer_size - copy_size);
+      new_dat->mem_block_size_ = buffer_size;
+      new_dat->char_index_offset_ = index_offset;
+      ObFTCharCodeIndex *index = reinterpret_cast<ObFTCharCodeIndex *>(new_dat->buff + index_offset);
+      index->init(bits);
+      new_dat->get_map()->fill_char_index(*index);
+      alloc_.free(dat_);
+      dat_ = new_dat;
+      map_ = dat_->get_map();
+    }
+  }
+  return ret;
+}
+
+template <typename DATA_TYPE>
 int ObFTDATBuilder<DATA_TYPE>::encode(const ObString &word, ObFTWordCode &code, bool add)
 {
   int ret = OB_SUCCESS;
@@ -252,15 +291,25 @@ int ObFTDATReader<DATA_TYPE>::match_with_hit(const ObString &ft_char,
                                              ObDATrieHit &hit) const
 {
   int ret = OB_SUCCESS;
-  ObFTWordCode code;
+  ObFTWordCode code = 0;
+  bool found = false;
   hit.set_unmatch();
-  auto *map = dat_->get_map();
+  const ObFTCharCodeIndex *index = dat_->get_char_index();
   int32_t *base = reinterpret_cast<int32_t *>(dat_->buff + dat_->base_offset_);
   int32_t *check = reinterpret_cast<int32_t *>(dat_->buff + dat_->check_offset_);
 
-  if (OB_FAIL(map->find(ft_char, code)) && OB_ENTRY_NOT_EXIST != ret) {
+  if (OB_NOT_NULL(index) && ObFTCharCodeIndex::is_indexable(ft_char.length())) {
+    // the index holds exactly the indexable words of the map
+    found = index->find(ObFTCharCodeIndex::make_key(ft_char.ptr(), ft_char.length()), code);
+  } else if (OB_FAIL(dat_->get_map()->find(ft_char, code)) && OB_ENTRY_NOT_EXIST != ret) {
   } else if (OB_ENTRY_NOT_EXIST == ret) {
     ret = OB_SUCCESS;
+  } else {
+    found = true;
+  }
+
+  if (OB_FAIL(ret)) {
+  } else if (!found) {
     hit.set_unmatch();
   } else {
     if (&last_hit == &hit) {
@@ -274,7 +323,10 @@ int ObFTDATReader<DATA_TYPE>::match_with_hit(const ObString &ft_char,
     // from current place to do check
     int32_t idx = abs(base[hit.base_idx_]) + code;
 
-    if (check[idx] != hit.base_idx_) {
+    if (OB_UNLIKELY(idx < 0 || idx >= static_cast<int64_t>(dat_->array_size_))) {
+      // out of the trie, so no transition
+      hit.set_unmatch();
+    } else if (check[idx] != hit.base_idx_) {
       hit.set_unmatch();
     } else if (base[idx] < 0) {
       hit.base_idx_ = idx;
@@ -364,6 +416,62 @@ size_t ObArrayHashMap::estimate_capacity(size_t word_num)
   constexpr size_t MIN_CAPACITY = 101;                   // prime
   size_t capacity = MAX(word_num * 4 / 3, MIN_CAPACITY); // 75%
   return capacity;
+}
+
+uint64_t ObArrayHashMap::indexable_count() const
+{
+  uint64_t cnt = 0;
+  for (uint64_t i = 0; i < header_.capacity_; ++i) {
+    const Entry &entry = header_.data[i];
+    if (entry.used && ObFTCharCodeIndex::is_indexable(entry.word.word_len)) {
+      ++cnt;
+    }
+  }
+  return cnt;
+}
+
+void ObArrayHashMap::fill_char_index(ObFTCharCodeIndex &index) const
+{
+  for (uint64_t i = 0; i < header_.capacity_; ++i) {
+    const Entry &entry = header_.data[i];
+    if (entry.used && ObFTCharCodeIndex::is_indexable(entry.word.word_len)) {
+      index.insert(ObFTCharCodeIndex::make_key(entry.word.word, entry.word.word_len), entry.code);
+    }
+  }
+}
+
+uint32_t ObFTCharCodeIndex::estimate_bits(const uint64_t key_count)
+{
+  uint32_t bits = MIN_BITS;
+  // keep at most half of the slots used
+  while (bits < 31 && (1ULL << bits) < 2 * key_count) {
+    ++bits;
+  }
+  return bits;
+}
+
+size_t ObFTCharCodeIndex::estimate_size(const uint32_t bits)
+{
+  return sizeof(ObFTCharCodeIndex) + ((1ULL << bits) - 1) * sizeof(Entry);
+}
+
+void ObFTCharCodeIndex::init(const uint32_t bits)
+{
+  bits_ = bits;
+  count_ = 0;
+  memset(entries_, 0, (1ULL << bits) * sizeof(Entry));
+}
+
+void ObFTCharCodeIndex::insert(const uint32_t key, const ObFTWordCode code)
+{
+  const uint32_t mask = (1U << bits_) - 1;
+  uint32_t pos = slot(key);
+  while (0 != entries_[pos].key_) {
+    pos = (pos + 1) & mask;
+  }
+  entries_[pos].key_ = key;
+  entries_[pos].code_ = code;
+  ++count_;
 }
 } //  namespace storage
 } //  namespace oceanbase

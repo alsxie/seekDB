@@ -151,6 +151,49 @@ ob_wc_t ObUnicodeBlockUtils::get_unicode_from_u8(const char *input, const uint8_
 }
 
 #define OB_IK_GET_NUMBER_UNICODE(str) get_unicode_from_u8(str, sizeof(str))
+namespace
+{
+// A bitmap over [min, max] of a set of code points: membership is one load instead of a scan of the
+// whole set.  作者：FDE WorkMate
+struct ObCodePointSet final
+{
+  enum : int64_t { MAX_SPAN = 1 << 16 };
+  ObCodePointSet(const ob_wc_t *arr, const int64_t cnt) : min_(0), max_(0), valid_(false)
+  {
+    memset(bits_, 0, sizeof(bits_));
+    if (cnt > 0) {
+      min_ = arr[0];
+      max_ = arr[0];
+      for (int64_t i = 1; i < cnt; ++i) {
+        min_ = MIN(min_, arr[i]);
+        max_ = MAX(max_, arr[i]);
+      }
+      if (max_ - min_ < MAX_SPAN) {
+        for (int64_t i = 0; i < cnt; ++i) {
+          const uint64_t off = arr[i] - min_;
+          bits_[off >> 6] |= (1ULL << (off & 63));
+        }
+        valid_ = true;
+      }
+    }
+  }
+  // only valid if valid_
+  OB_INLINE bool contains(const ob_wc_t unicode) const
+  {
+    bool found = false;
+    if (unicode >= min_ && unicode <= max_) {
+      const uint64_t off = unicode - min_;
+      found = 0 != (bits_[off >> 6] & (1ULL << (off & 63)));
+    }
+    return found;
+  }
+  ob_wc_t min_;
+  ob_wc_t max_;
+  bool valid_;
+  uint64_t bits_[MAX_SPAN / 64];
+};
+} // namespace
+
 bool ObUnicodeBlockUtils::is_unicode_cn_number(ob_wc_t unicode)
 {
   // Chinese numerical characters: "一二两三四五六七八九十零壹贰叁肆伍陆柒捌玖拾百千万亿拾佰仟萬億兆卅廿"
@@ -173,12 +216,16 @@ bool ObUnicodeBlockUtils::is_unicode_cn_number(ob_wc_t unicode)
       OB_IK_GET_NUMBER_UNICODE("億"), OB_IK_GET_NUMBER_UNICODE("兆"),
       OB_IK_GET_NUMBER_UNICODE("卅"), OB_IK_GET_NUMBER_UNICODE("廿"),
   };
-  for (int i = 0; i < sizeof(cn_number_array) / sizeof(cn_number_array[0]); i++) {
-    if (unicode == cn_number_array[i]) {
-      return true;
+  static const ObCodePointSet cn_number_set(cn_number_array, ARRAYSIZEOF(cn_number_array));
+  bool is_cn_number = false;
+  if (OB_LIKELY(cn_number_set.valid_)) {
+    is_cn_number = cn_number_set.contains(unicode);
+  } else {
+    for (int i = 0; !is_cn_number && i < sizeof(cn_number_array) / sizeof(cn_number_array[0]); i++) {
+      is_cn_number = (unicode == cn_number_array[i]);
     }
   }
-  return false;
+  return is_cn_number;
 }
 
 } //  namespace storage

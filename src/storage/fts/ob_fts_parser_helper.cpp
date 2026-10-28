@@ -106,8 +106,32 @@ int ObFTParser::serialize_to_str(char *buf, const int64_t buf_len)
     ret = OB_INVALID_ARGUMENT;
   } else if (OB_UNLIKELY(!is_valid())) {
     ret = OB_NOT_SUPPORTED;
-  } else if (OB_FAIL(common::databuff_printf(buf, buf_len, pos, "%.*s.%ld", parser_name_.len(), parser_name_.str(),
-          parser_version_))) {
+  } else {
+    // Writes the same bytes as databuff_printf("%.*s.%ld") without going through vsnprintf, which
+    // is visible when TOKENIZE() runs once per row. is_valid() means parser_version_ >= 0.
+    // 作者：FDE WorkMate
+    char digits[24];
+    int64_t digit_cnt = 0;
+    uint64_t version = static_cast<uint64_t>(parser_version_);
+    do {
+      digits[digit_cnt++] = static_cast<char>('0' + version % 10);
+      version /= 10;
+    } while (version > 0);
+    const int64_t name_len = parser_name_.len();
+    if (name_len + 1 + digit_cnt + 1 > buf_len) {
+      // does not fit, keep the original behaviour (overflow error)
+      if (OB_FAIL(common::databuff_printf(buf, buf_len, pos, "%.*s.%ld", parser_name_.len(),
+              parser_name_.str(), parser_version_))) {
+      }
+    } else {
+      MEMCPY(buf, parser_name_.str(), name_len);
+      pos = name_len;
+      buf[pos++] = '.';
+      while (digit_cnt > 0) {
+        buf[pos++] = digits[--digit_cnt];
+      }
+      buf[pos] = '\0';
+    }
   }
   return ret;
 }

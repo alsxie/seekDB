@@ -50,7 +50,23 @@ public:
     ObFTSingleWord start_;
     ObFTSingleWord end_;
     ObIFTDict *dict_; // a cache dict
+    // start_/end_ packed by range_key(), integer order equals the byte order of the words
+    uint64_t start_key_;
+    uint64_t end_key_;
   };
+
+  // Packs a word of at most MAX_RANGE_KEY_LEN bytes into an integer: bytes big endian from the top,
+  // zero padded, length in the lowest byte.  Comparing two keys gives the same order as comparing
+  // the words bytewise with the shorter one first on a common prefix.  作者：FDE WorkMate
+  static constexpr int64_t MAX_RANGE_KEY_LEN = 7;
+  static OB_INLINE uint64_t range_key(const char *ptr, const int64_t len)
+  {
+    uint64_t key = static_cast<uint64_t>(len);
+    for (int64_t i = 0; i < len; ++i) {
+      key |= static_cast<uint64_t>(static_cast<unsigned char>(ptr[i])) << (56 - 8 * i);
+    }
+    return key;
+  }
 
 public:
   int init() override;

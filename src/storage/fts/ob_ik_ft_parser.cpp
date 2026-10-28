@@ -40,6 +40,26 @@ namespace oceanbase
 {
 namespace storage
 {
+// ObCharset::collation_type() searches the collation by name.  Charset infos are static objects,
+// so the result for the same object never changes: remember the last one per thread.
+// 作者：FDE WorkMate
+static ObCollationType collation_type_of(const ObCharsetInfo *cs)
+{
+  static thread_local const ObCharsetInfo *last_cs = nullptr;
+  static thread_local const char *last_name = nullptr;
+  static thread_local ObCollationType last_coll_type = CS_TYPE_INVALID;
+  ObCollationType coll_type = CS_TYPE_INVALID;
+  if (cs == last_cs && cs->name == last_name) {
+    coll_type = last_coll_type;
+  } else {
+    coll_type = ObCharset::collation_type(cs->name);
+    last_cs = cs;
+    last_name = cs->name;
+    last_coll_type = coll_type;
+  }
+  return coll_type;
+}
+
 int ObIKFTParser::init(const ObFTParserParam &param)
 {
   int ret = OB_SUCCESS;
@@ -50,7 +70,7 @@ int ObIKFTParser::init(const ObFTParserParam &param)
     coll_type_ = ObCollationType::CS_TYPE_INVALID;
     if (OB_ISNULL(param.cs_) || OB_ISNULL(param.cs_->name)) {
       ret = OB_INVALID_ARGUMENT;
-    } else if (CS_TYPE_INVALID == (coll_type_ = ObCharset::collation_type(param.cs_->name))) {
+    } else if (CS_TYPE_INVALID == (coll_type_ = collation_type_of(param.cs_))) {
       ret = OB_INVALID_ARGUMENT;
     } else if (OB_FAIL(init_dict(param))) {
     } else if (OB_FAIL(init_ctx(param))) {
@@ -248,17 +268,14 @@ int ObIKFTParser::init_dict(const ObFTParserParam &param)
                               ObCharsetType::CHARSET_UTF8MB4,
                               ObCollationType::CS_TYPE_UTF8MB4_BIN);
 
-  ObFTDictDesc stopword_dict_desc("stopword",
-                                  ObFTDictType::DICT_IK_STOP,
-                                  ObCharsetType::CHARSET_UTF8MB4,
-                                  ObCollationType::CS_TYPE_UTF8MB4_BIN);
-
+  // The IK stop word dict is not loaded: get_next_token() does not filter stop words (the match is
+  // disabled there), so pinning its cache ranges and building a range dict for every parser was
+  // pure overhead.  dict_stop_ stays nullptr.  作者：FDE WorkMate
   if (should_read_newest_table()) {
     // clear dict cache, always false now
   } else {
     if (OB_FAIL(init_single_dict(main_dict_desc, cache_main_))) {
     } else if (OB_FAIL(init_single_dict(quan_dict_desc, cache_quan_))) {
-    } else if (OB_FAIL(init_single_dict(stopword_dict_desc, cache_stop_))) {
     }
   }
 
@@ -266,7 +283,6 @@ int ObIKFTParser::init_dict(const ObFTParserParam &param)
     // already logged.
   } else if (OB_FAIL(build_dict_from_cache(main_dict_desc, cache_main_, dict_main_))) {
   } else if (OB_FAIL(build_dict_from_cache(quan_dict_desc, cache_quan_, dict_quan_))) {
-  } else if (OB_FAIL(build_dict_from_cache(stopword_dict_desc, cache_stop_, dict_stop_))) {
   }
 
   return ret;

@@ -390,7 +390,24 @@ int ObFTRangeDict::find_first_char_range(const ObString &single_word, ObIFTDict 
 {
   int ret = OB_SUCCESS;
   bool found = false;
-  if (is_sorted_disjoint_) {
+  if (is_sorted_disjoint_ && single_word.length() <= MAX_RANGE_KEY_LEN) {
+    // Same search as below on packed integer keys.  作者：FDE WorkMate
+    const uint64_t key = range_key(single_word.ptr(), single_word.length());
+    int64_t lo = 0;
+    int64_t hi = range_dicts_.size();
+    while (lo < hi) {
+      const int64_t mid = lo + (hi - lo) / 2;
+      if (range_dicts_[mid].start_key_ <= key) {
+        lo = mid + 1;
+      } else {
+        hi = mid;
+      }
+    }
+    if (lo > 0 && range_dicts_[lo - 1].end_key_ >= key) {
+      dict = range_dicts_[lo - 1].dict_;
+      found = true;
+    }
+  } else if (is_sorted_disjoint_) {
     // Ranges are sorted by start and do not overlap: the candidate is the last range whose
     // start <= word.  作者：FDE WorkMate
     int64_t lo = 0;
@@ -467,6 +484,8 @@ int ObFTRangeDict::build_dict_from_cache(const ObFTCacheRangeContainer &range_co
       range.start_ = dat->start_word_;
       range.end_ = dat->end_word_;
       range.dict_ = dict;
+      range.start_key_ = range_key(range.start_.word, range.start_.word_len);
+      range.end_key_ = range_key(range.end_.word, range.end_.word_len);
       if (OB_FAIL(range_dicts_.push_back(range))) {
       }
     }
