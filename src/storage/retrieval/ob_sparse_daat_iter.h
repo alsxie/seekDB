@@ -97,6 +97,14 @@ protected:
   virtual int cache_result(int64_t &count, const ObDatum &id_datum, const double relevance);
   virtual int project_results(const int64_t count);
   int init_merge_heap(const int64_t count);
+  // Unscored merge: when neither a relevance score, a projected score nor a filter is needed and
+  // any matching dimension makes a document valid, the merged result is just the ordered union of
+  // the dimension id streams.  It is produced by a linear minimum scan over the few dimension
+  // heads instead of the heap and the relevance collector.  Subclasses that rely on the per-row
+  // hooks above must not enable it.  作者：FDE WorkMate
+  int init_unscored_merge();
+  int do_one_unscored_merge_round(int64_t &count);
+  static const int64_t UNSCORED_LINEAR_MERGE_MAX_DIM = 8;
 protected:
   ObIAllocator *iter_allocator_;
   ObSparseRetrievalMergeParam *iter_param_;
@@ -110,6 +118,8 @@ protected:
   ObFixedArray<int64_t, ObIAllocator> next_round_iter_idxes_;
   int64_t next_round_cnt_;
   void (*set_datum_func_)(ObDatum &, const ObDocIdExt &);
+  bool unscored_merge_;
+  ObFixedArray<bool, ObIAllocator> dim_iter_ended_;
 private:
   DISALLOW_COPY_AND_ASSIGN(ObSRDaaTIterImpl);
 };

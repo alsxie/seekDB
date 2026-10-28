@@ -3,7 +3,8 @@
 # description: result-equivalence guards for the fulltext performance changes
 #   (parallel index build, binary doc id compare, relevance skip for bare MATCH filters,
 #    sorted range dict / charset fast paths used by IK, utf8mb4 general_ci prefix skip,
-#    unobserved LIMIT views without relevance order, memoized tokenize properties).
+#    unobserved LIMIT views without relevance order, memoized tokenize properties,
+#    unscored posting-list merge, inverted-table-only build parallelism).
 # 作者：FDE WorkMate
 
 --disable_warnings
@@ -49,6 +50,22 @@ select count(*) from docs where match(content) against('search tokenizer');
 select count(*) from docs where match(content) against('+search -tokenizer' in boolean mode);
 select id from docs where match(content) against('倒排索引 tokenizer') order by id limit 10;
 select count(*), min(id), max(id), sum(id) from docs where match(title, content) against('OceanBase search');
+
+# unscored merge of posting lists (no relevance, no projection, up to 8 dims) must return the
+# same row set as the scored path; >8 dims and missing tokens fall back / are skipped
+select count(*), sum(id) from docs where match(content) against('倒排索引 tokenizer');
+select count(*), sum(id) from docs where match(content) against('倒排索引 tokenizer') > 0;
+select count(*), sum(id) from docs where match(title, content) against('OceanBase 数据库 中文 noise 其它 search 无关 BM25');
+select count(*), sum(id) from docs where match(title, content) against('OceanBase 数据库 中文 noise 其它 search 无关 BM25 relevance 公斤');
+select count(*), sum(id) from docs where match(title, content) against('OceanBase 数据库 中文 noise 其它 search 无关 BM25 relevance 公斤') > 0;
+select count(*) from docs where match(content) against('notexistword1 notexistword2');
+select count(*), sum(id) from docs where match(content) against('notexistword1 BM25');
+select count(*) from docs where match(content) against('BM25') and id % 3 = 0;
+
+# implicit relevance order with ties: doc id tables keep the upstream build degree, so the
+# tie order (doc id order) is the same as upstream
+select id from docs where match(content) against('倒排索引 tokenizer') limit 8;
+select id from docs where match(title, content) against('分词器') limit 8;
 
 # score still projected when it is used
 select id, round(match(content) against('BM25 relevance') , 4) as s from docs

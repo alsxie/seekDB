@@ -64,6 +64,82 @@ select count(*), min(id), max(id), sum(id) from docs where match(title, content)
 |      229 |       1 |     400 |   45886 |
 +----------+---------+---------+---------+
 
+select count(*), sum(id) from docs where match(content) against('倒排索引 tokenizer');
++----------+---------+
+| count(*) | sum(id) |
++----------+---------+
+|      171 |   34314 |
++----------+---------+
+select count(*), sum(id) from docs where match(content) against('倒排索引 tokenizer') > 0;
++----------+---------+
+| count(*) | sum(id) |
++----------+---------+
+|      171 |   34314 |
++----------+---------+
+select count(*), sum(id) from docs where match(title, content) against('OceanBase 数据库 中文 noise 其它 search 无关 BM25');
++----------+---------+
+| count(*) | sum(id) |
++----------+---------+
+|      400 |   80200 |
++----------+---------+
+select count(*), sum(id) from docs where match(title, content) against('OceanBase 数据库 中文 noise 其它 search 无关 BM25 relevance 公斤');
++----------+---------+
+| count(*) | sum(id) |
++----------+---------+
+|      400 |   80200 |
++----------+---------+
+select count(*), sum(id) from docs where match(title, content) against('OceanBase 数据库 中文 noise 其它 search 无关 BM25 relevance 公斤') > 0;
++----------+---------+
+| count(*) | sum(id) |
++----------+---------+
+|      400 |   80200 |
++----------+---------+
+select count(*) from docs where match(content) against('notexistword1 notexistword2');
++----------+
+| count(*) |
++----------+
+|        0 |
++----------+
+select count(*), sum(id) from docs where match(content) against('notexistword1 BM25');
++----------+---------+
+| count(*) | sum(id) |
++----------+---------+
+|       57 |   11286 |
++----------+---------+
+select count(*) from docs where match(content) against('BM25') and id % 3 = 0;
++----------+
+| count(*) |
++----------+
+|       19 |
++----------+
+
+select id from docs where match(content) against('倒排索引 tokenizer') limit 8;
++-----+
+| id  |
++-----+
+| 280 |
+|  28 |
+| 259 |
+|   7 |
+|  14 |
+| 266 |
+|  21 |
+| 273 |
++-----+
+select id from docs where match(title, content) against('分词器') limit 8;
++-----+
+| id  |
++-----+
+| 277 |
+|  25 |
+| 263 |
+| 270 |
+| 256 |
+|   4 |
+|  18 |
+|  11 |
++-----+
+
 select id, round(match(content) against('BM25 relevance') , 4) as s from docs
   where match(content) against('BM25 relevance') order by s desc, id limit 5;
 +----+--------+

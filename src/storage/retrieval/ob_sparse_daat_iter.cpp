@@ -87,7 +87,9 @@ ObSRDaaTIterImpl::ObSRDaaTIterImpl()
     buffered_relevances_(),
     next_round_iter_idxes_(),
     next_round_cnt_(0),
-    set_datum_func_(nullptr)
+    set_datum_func_(nullptr),
+    unscored_merge_(false),
+    dim_iter_ended_()
 {
 }
 
@@ -161,6 +163,8 @@ void ObSRDaaTIterImpl::reset()
   buffered_relevances_.reset();
   next_round_iter_idxes_.reset();
   next_round_cnt_ = 0;
+  unscored_merge_ = false;
+  dim_iter_ended_.reset();
   input_row_cnt_ = 0;
   output_row_cnt_ = 0;
   is_inited_ = false;
@@ -176,6 +180,9 @@ void ObSRDaaTIterImpl::reuse(const bool switch_tablet)
     next_round_cnt_ = dim_iters_->count();
     for (int64_t i = 0; i < next_round_cnt_; ++i) {
       next_round_iter_idxes_[i] = i;
+    }
+    for (int64_t i = 0; i < dim_iter_ended_.count(); ++i) {
+      dim_iter_ended_[i] = false;
     }
   }
   if (OB_NOT_NULL(relevance_collector_)) {
@@ -238,7 +245,7 @@ int ObSRDaaTIterImpl::get_next_rows(const int64_t capacity, int64_t &count)
     count = 0;
     const int64_t real_capacity = MIN(capacity, iter_param_->max_batch_size_);
     while (OB_SUCC(ret) && count < real_capacity) {
-      if (OB_FAIL(do_one_merge_round(count))) {
+      if (OB_FAIL(unscored_merge_ ? do_one_unscored_merge_round(count) : do_one_merge_round(count))) {
         if (OB_UNLIKELY(OB_ITER_END != ret)) {
         }
       }
@@ -271,6 +278,89 @@ int ObSRDaaTIterImpl::do_one_merge_round(int64_t &count)
   } else if (need_project && OB_FAIL(filter_on_demand(count, relevance, need_project))) {
   } else if (need_project && OB_FAIL(cache_result(count, *id_datum, relevance))) {
     if (OB_ITER_END != ret) {
+    }
+  }
+  return ret;
+}
+
+int ObSRDaaTIterImpl::init_unscored_merge()
+{
+  int ret = OB_SUCCESS;
+  const int64_t dim_cnt = OB_ISNULL(dim_iters_) ? 0 : dim_iters_->count();
+  unscored_merge_ = false;
+  if (IS_NOT_INIT) {
+    ret = OB_NOT_INIT;
+  } else if (nullptr == iter_param_->relevance_expr_
+      && !iter_param_->need_project_relevance()
+      && !iter_param_->need_filter()
+      && relevance_collector_->is_any_dim_match()
+      && dim_cnt > 0
+      && dim_cnt <= UNSCORED_LINEAR_MERGE_MAX_DIM) {
+    if (FALSE_IT(dim_iter_ended_.set_allocator(iter_allocator_))) {
+    } else if (OB_FAIL(dim_iter_ended_.init(dim_cnt))) {
+    } else if (OB_FAIL(dim_iter_ended_.prepare_allocate(dim_cnt))) {
+    } else {
+      for (int64_t i = 0; i < dim_cnt; ++i) {
+        dim_iter_ended_[i] = false;
+      }
+      unscored_merge_ = true;
+    }
+  }
+  return ret;
+}
+
+// Produces the next smallest id of the union of all dimension streams, in the same order as the
+// heap based merge.  next_round_iter_idxes_ holds the dimensions positioned on the id output by
+// the previous round; they are advanced first.  作者：FDE WorkMate
+int ObSRDaaTIterImpl::do_one_unscored_merge_round(int64_t &count)
+{
+  int ret = OB_SUCCESS;
+  for (int64_t i = 0; OB_SUCC(ret) && i < next_round_cnt_; ++i) {
+    const int64_t iter_idx = next_round_iter_idxes_[i];
+    ObISRDaaTDimIter *dim_iter = dim_iters_->at(iter_idx);
+    if (OB_ISNULL(dim_iter)) {
+      ret = OB_ERR_UNEXPECTED;
+    } else if (OB_FAIL(dim_iter->get_next_row())) {
+      if (OB_ITER_END == ret) {
+        dim_iter_ended_[iter_idx] = true;
+        ret = OB_SUCCESS;
+      } else {
+        LOG_WARN("fail to get next row of dimension iter", K(ret), K(iter_idx));
+      }
+    } else if (OB_FAIL(dim_iter->get_curr_id(iter_domain_ids_[iter_idx]))) {
+    }
+  }
+  if (OB_SUCC(ret)) {
+    next_round_cnt_ = 0;
+    int64_t min_idx = -1;
+    ObSRMergeItem min_item;
+    ObSRMergeItem curr_item;
+    int64_t cmp_ret = 0;
+    for (int64_t iter_idx = 0; OB_SUCC(ret) && iter_idx < dim_iter_ended_.count(); ++iter_idx) {
+      if (dim_iter_ended_[iter_idx]) {
+      } else if (min_idx < 0) {
+        min_idx = iter_idx;
+        min_item.iter_idx_ = iter_idx;
+        next_round_iter_idxes_[next_round_cnt_++] = iter_idx;
+      } else if (FALSE_IT(curr_item.iter_idx_ = iter_idx)) {
+      } else if (OB_FAIL(merge_cmp_.cmp(curr_item, min_item, cmp_ret))) {
+      } else if (cmp_ret < 0) {
+        min_idx = iter_idx;
+        min_item.iter_idx_ = iter_idx;
+        next_round_cnt_ = 0;
+        next_round_iter_idxes_[next_round_cnt_++] = iter_idx;
+      } else if (0 == cmp_ret) {
+        next_round_iter_idxes_[next_round_cnt_++] = iter_idx;
+      }
+    }
+    if (OB_FAIL(ret)) {
+    } else if (min_idx < 0) {
+      ret = OB_ITER_END;
+    } else if (OB_ISNULL(iter_domain_ids_[min_idx])) {
+      ret = OB_ERR_UNEXPECTED;
+    } else if (OB_FAIL(cache_result(count, *iter_domain_ids_[min_idx], 0.0))) {
+      if (OB_UNLIKELY(OB_ITER_END != ret)) {
+      }
     }
   }
   return ret;

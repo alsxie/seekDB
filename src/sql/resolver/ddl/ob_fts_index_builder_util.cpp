@@ -1032,6 +1032,19 @@ int ObFtsIndexBuilderUtil::generate_doc_id_column(
   return ret;
 }
 
+// Building the inverted tables (word-doc and doc-word) tokenizes, sorts and writes every word of
+// every document, which is CPU bound.  Without an explicit degree the task degree is 1 and a single
+// PX worker does all of it, so a small cpu-bounded degree is used for these two tables only.  The
+// doc id tables keep the task degree: doc ids are generated while they are built and a parallel
+// build hands them out in a run-dependent order, which would make the order of equally relevant
+// documents differ between otherwise identical builds.  作者：FDE WorkMate
+int64_t ObFtsIndexBuilderUtil::decide_inverted_build_parallelism(const int64_t task_parallelism)
+{
+  return task_parallelism > 1
+      ? task_parallelism
+      : MIN(FTS_AUTO_MAX_PARALLELISM, MAX(1L, static_cast<int64_t>(common::get_cpu_num()) / 2));
+}
+
 int ObFtsIndexBuilderUtil::decide_parallelism(
     const share::schema::ObIndexType index_type,
     const int64_t original_parallelism,
@@ -1046,16 +1059,9 @@ int ObFtsIndexBuilderUtil::decide_parallelism(
         decided_parallelism = MAX(original_parallelism, 1L);
         break;
       case share::schema::ObIndexType::INDEX_TYPE_DOC_ID_ROWKEY_LOCAL:
-        decided_parallelism = MAX(original_parallelism / 3, 1L);
-        break;
       case share::schema::ObIndexType::INDEX_TYPE_FTS_INDEX_LOCAL:
       case share::schema::ObIndexType::INDEX_TYPE_FTS_DOC_WORD_LOCAL:
-        // Building the inverted tables tokenizes, sorts and writes every word of every document,
-        // which is CPU bound.  Without an explicit degree (the default 1) a single PX worker
-        // does all of it, so pick a small cpu-bounded degree instead.  作者：FDE WorkMate
-        decided_parallelism = original_parallelism > 1
-            ? MAX(original_parallelism / 3, 1L)
-            : MIN(FTS_AUTO_MAX_PARALLELISM, MAX(1L, static_cast<int64_t>(common::get_cpu_num()) / 2));
+        decided_parallelism = MAX(original_parallelism / 3, 1L);
         break;
       case share::schema::ObIndexType::INDEX_TYPE_NORMAL_MULTIVALUE_LOCAL:
       case share::schema::ObIndexType::INDEX_TYPE_UNIQUE_MULTIVALUE_LOCAL:
