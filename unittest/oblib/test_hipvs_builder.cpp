@@ -16,7 +16,9 @@
 
 // Author：FDE WorkMate
 //
-// Usage: test_hipvs_builder <path to hipvs mock plugin>
+// Usage: test_hipvs_builder [path to hipvs mock plugin]
+// Without an argument the mock plugin is looked up in SEEKDB_HIPVS_MOCK_PLUGIN, the Bazel
+// runfiles tree, and next to the test binary, so direct runs and `bazel run` work too.
 
 #include "hnswlib_stream_fixture.h"
 #include "lib/vector/ob_hipvs_builder.h"
@@ -28,6 +30,7 @@
 #include <map>
 #include <string>
 #include <thread>
+#include <unistd.h>
 #include <vector>
 
 using namespace oceanbase::common::obvsag;
@@ -249,16 +252,71 @@ void test_concurrency_bound(const std::string &library)
   dlclose(handle);
 }
 
+const char MOCK_PLUGIN_NAME[] = "libhipvs_mock_plugin.so";
+
+std::string directory_of(const std::string &path)
+{
+  const size_t slash = path.rfind('/');
+  return slash == std::string::npos ? std::string(".") : path.substr(0, slash);
+}
+
+bool readable(const std::string &path)
+{
+  return !path.empty() && access(path.c_str(), R_OK) == 0;
+}
+
+// Resolution order: explicit argument, SEEKDB_HIPVS_MOCK_PLUGIN, Bazel runfiles, the
+// directory of argv[0] (keeps runfiles symlinks), then the resolved executable directory.
+std::string find_mock_plugin(int argc, char **argv, std::vector<std::string> &tried)
+{
+  std::vector<std::string> candidates;
+  if (argc > 1) {
+    candidates.push_back(argv[1]);
+  }
+  if (const char *from_env = std::getenv("SEEKDB_HIPVS_MOCK_PLUGIN")) {
+    candidates.push_back(from_env);
+  }
+  for (const char *runfiles_variable : {"RUNFILES_DIR", "TEST_SRCDIR"}) {
+    if (const char *runfiles = std::getenv(runfiles_variable)) {
+      candidates.push_back(std::string(runfiles) + "/_main/unittest/oblib/" + MOCK_PLUGIN_NAME);
+    }
+  }
+  if (argc > 0 && argv[0] != nullptr) {
+    candidates.push_back(directory_of(argv[0]) + "/" + MOCK_PLUGIN_NAME);
+  }
+  char executable[4096] = {0};
+  const ssize_t length = readlink("/proc/self/exe", executable, sizeof(executable) - 1);
+  if (length > 0) {
+    candidates.push_back(directory_of(std::string(executable, static_cast<size_t>(length))) + "/" +
+                         MOCK_PLUGIN_NAME);
+  }
+  for (const std::string &candidate : candidates) {
+    tried.push_back(candidate);
+    if (readable(candidate)) {
+      return candidate;
+    }
+    if (argc > 1 && candidate == argv[1]) {
+      return std::string();  // an explicit path must exist; do not silently use another plugin
+    }
+  }
+  return std::string();
+}
+
 }  // namespace
 
 int main(int argc, char **argv)
 {
-  const char *from_env = std::getenv("SEEKDB_HIPVS_MOCK_PLUGIN");
-  const std::string library = argc > 1 ? argv[1] : (from_env == nullptr ? "" : from_env);
+  std::vector<std::string> tried;
+  const std::string library = find_mock_plugin(argc, argv, tried);
   if (library.empty()) {
-    std::cerr << "usage: test_hipvs_builder <mock plugin path>" << std::endl;
+    std::cerr << "test_hipvs_builder: cannot find " << MOCK_PLUGIN_NAME << "; tried:" << std::endl;
+    for (const std::string &path : tried) {
+      std::cerr << "  " << path << std::endl;
+    }
+    std::cerr << "usage: test_hipvs_builder [mock plugin path]" << std::endl;
     return 2;
   }
+  std::cout << "test_hipvs_builder: using mock plugin " << library << std::endl;
   test_config_parsing();
   test_supported_shapes();
   test_not_requested(library);
