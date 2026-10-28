@@ -61,15 +61,9 @@ int ObSRMergeCmp::cmp(
   if (IS_NOT_INIT) {
     ret = OB_NOT_INIT;
   } else {
-    int tmp_ret = 0;
     const ObDatum &l_id = get_id_datum(l.iter_idx_);
     const ObDatum &r_id = get_id_datum(r.iter_idx_);
-    if (is_binary_str_) {
-      cmp_ret = bytewise_null_first_cmp(l_id, r_id);
-    } else if (OB_FAIL(cmp_func_(l_id, r_id, tmp_ret, nullptr))) {
-    } else {
-      cmp_ret = tmp_ret;
-    }
+    ret = cmp_id(l_id, r_id, cmp_ret);
   }
   return ret;
 }
@@ -244,9 +238,13 @@ int ObSRDaaTIterImpl::get_next_rows(const int64_t capacity, int64_t &count)
   } else {
     count = 0;
     const int64_t real_capacity = MIN(capacity, iter_param_->max_batch_size_);
-    while (OB_SUCC(ret) && count < real_capacity) {
-      if (OB_FAIL(unscored_merge_ ? do_one_unscored_merge_round(count) : do_one_merge_round(count))) {
-        if (OB_UNLIKELY(OB_ITER_END != ret)) {
+    if (unscored_merge_) {
+      ret = fill_unscored_batch(real_capacity, count);
+    } else {
+      while (OB_SUCC(ret) && count < real_capacity) {
+        if (OB_FAIL(do_one_merge_round(count))) {
+          if (OB_UNLIKELY(OB_ITER_END != ret)) {
+          }
         }
       }
     }
@@ -309,57 +307,84 @@ int ObSRDaaTIterImpl::init_unscored_merge()
   return ret;
 }
 
-// Produces the next smallest id of the union of all dimension streams, in the same order as the
-// heap based merge.  next_round_iter_idxes_ holds the dimensions positioned on the id output by
-// the previous round; they are advanced first.  作者：FDE WorkMate
-int ObSRDaaTIterImpl::do_one_unscored_merge_round(int64_t &count)
+// Fills one output batch with the ordered union of the dimension id streams, in the same order as
+// the heap based merge.  next_round_iter_idxes_ holds the dimensions positioned on the id output
+// last; they are advanced first, then the smallest head among the live dimensions is output and
+// every dimension positioned on it is queued for the next step.  This runs once per posting, so
+// it walks the arrays through raw pointers, compares ids inline and caches the result in place
+// (same offset/limit handling as cache_result()).  作者：FDE WorkMate
+int ObSRDaaTIterImpl::fill_unscored_batch(const int64_t capacity, int64_t &count)
 {
   int ret = OB_SUCCESS;
-  for (int64_t i = 0; OB_SUCC(ret) && i < next_round_cnt_; ++i) {
-    const int64_t iter_idx = next_round_iter_idxes_[i];
-    ObISRDaaTDimIter *dim_iter = dim_iters_->at(iter_idx);
-    if (OB_ISNULL(dim_iter)) {
-      ret = OB_ERR_UNEXPECTED;
-    } else if (OB_FAIL(dim_iter->get_next_row())) {
-      if (OB_ITER_END == ret) {
-        dim_iter_ended_[iter_idx] = true;
-        ret = OB_SUCCESS;
-      } else {
-        LOG_WARN("fail to get next row of dimension iter", K(ret), K(iter_idx));
-      }
-    } else if (OB_FAIL(dim_iter->get_curr_id(iter_domain_ids_[iter_idx]))) {
-    }
+  const int64_t dim_cnt = dim_iter_ended_.count();
+  const common::ObLimitParam *limit_param = iter_param_->limit_param_;
+  const bool has_limit = limit_param->is_valid();
+  const int64_t limit = limit_param->limit_;
+  const int64_t offset = limit_param->offset_;
+  ObISRDaaTDimIter *const *dims = dim_iters_->get_data();
+  const ObDatum **heads = iter_domain_ids_.get_data();
+  bool *ended = dim_iter_ended_.get_data();
+  int64_t *next_idxes = next_round_iter_idxes_.get_data();
+  ObDocIdExt *out_ids = buffered_domain_ids_.get_data();
+  double *out_relevances = buffered_relevances_.get_data();
+  if (OB_UNLIKELY(capacity > buffered_domain_ids_.count() || capacity > buffered_relevances_.count()
+                  || dim_cnt != dim_iters_->count() || dim_cnt != iter_domain_ids_.count()
+                  || dim_cnt != next_round_iter_idxes_.count())) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("unexpected unscored merge state", K(ret), K(capacity), K(dim_cnt),
+        K(buffered_domain_ids_.count()), K(iter_domain_ids_.count()));
   }
-  if (OB_SUCC(ret)) {
-    next_round_cnt_ = 0;
-    int64_t min_idx = -1;
-    ObSRMergeItem min_item;
-    ObSRMergeItem curr_item;
-    int64_t cmp_ret = 0;
-    for (int64_t iter_idx = 0; OB_SUCC(ret) && iter_idx < dim_iter_ended_.count(); ++iter_idx) {
-      if (dim_iter_ended_[iter_idx]) {
-      } else if (min_idx < 0) {
-        min_idx = iter_idx;
-        min_item.iter_idx_ = iter_idx;
-        next_round_iter_idxes_[next_round_cnt_++] = iter_idx;
-      } else if (FALSE_IT(curr_item.iter_idx_ = iter_idx)) {
-      } else if (OB_FAIL(merge_cmp_.cmp(curr_item, min_item, cmp_ret))) {
-      } else if (cmp_ret < 0) {
-        min_idx = iter_idx;
-        min_item.iter_idx_ = iter_idx;
-        next_round_cnt_ = 0;
-        next_round_iter_idxes_[next_round_cnt_++] = iter_idx;
-      } else if (0 == cmp_ret) {
-        next_round_iter_idxes_[next_round_cnt_++] = iter_idx;
+  while (OB_SUCC(ret) && count < capacity) {
+    for (int64_t i = 0; OB_SUCC(ret) && i < next_round_cnt_; ++i) {
+      const int64_t iter_idx = next_idxes[i];
+      ObISRDaaTDimIter *dim_iter = dims[iter_idx];
+      if (OB_ISNULL(dim_iter)) {
+        ret = OB_ERR_UNEXPECTED;
+      } else if (OB_FAIL(dim_iter->get_next_row())) {
+        if (OB_ITER_END == ret) {
+          ended[iter_idx] = true;
+          ret = OB_SUCCESS;
+        } else {
+          LOG_WARN("fail to get next row of dimension iter", K(ret), K(iter_idx));
+        }
+      } else if (OB_FAIL(dim_iter->get_curr_id(heads[iter_idx]))) {
+      } else if (OB_ISNULL(heads[iter_idx])) {
+        ret = OB_ERR_UNEXPECTED;
       }
     }
-    if (OB_FAIL(ret)) {
-    } else if (min_idx < 0) {
-      ret = OB_ITER_END;
-    } else if (OB_ISNULL(iter_domain_ids_[min_idx])) {
-      ret = OB_ERR_UNEXPECTED;
-    } else if (OB_FAIL(cache_result(count, *iter_domain_ids_[min_idx], 0.0))) {
-      if (OB_UNLIKELY(OB_ITER_END != ret)) {
+    if (OB_SUCC(ret)) {
+      next_round_cnt_ = 0;
+      const ObDatum *min_id = nullptr;
+      int64_t cmp_ret = 0;
+      for (int64_t iter_idx = 0; OB_SUCC(ret) && iter_idx < dim_cnt; ++iter_idx) {
+        if (ended[iter_idx]) {
+        } else if (nullptr == min_id) {
+          min_id = heads[iter_idx];
+          next_idxes[next_round_cnt_++] = iter_idx;
+        } else if (OB_FAIL(merge_cmp_.cmp_id(*heads[iter_idx], *min_id, cmp_ret))) {
+        } else if (cmp_ret < 0) {
+          min_id = heads[iter_idx];
+          next_round_cnt_ = 0;
+          next_idxes[next_round_cnt_++] = iter_idx;
+        } else if (0 == cmp_ret) {
+          next_idxes[next_round_cnt_++] = iter_idx;
+        }
+      }
+      if (OB_FAIL(ret)) {
+      } else if (nullptr == min_id) {
+        ret = OB_ITER_END;
+      } else if (FALSE_IT(++input_row_cnt_)) {
+      } else if (has_limit && input_row_cnt_ <= offset) {
+        // skipped by the offset, not projected
+      } else if (OB_FAIL(out_ids[count].from_datum(*min_id))) {
+        LOG_WARN("fail to cache domain id", K(ret), KPC(min_id));
+      } else {
+        out_relevances[count] = 0.0;
+        ++count;
+        ++output_row_cnt_;
+        if (has_limit && output_row_cnt_ >= limit) {
+          ret = OB_ITER_END;
+        }
       }
     }
   }
@@ -510,7 +535,35 @@ int ObSRDaaTIterImpl::project_results(const int64_t count)
   ObEvalCtx *eval_ctx = iter_param_->eval_ctx_;
   ObEvalCtx::BatchInfoScopeGuard guard(*eval_ctx);
 
-  if (eval_ctx->is_vectorized()) {
+  if (eval_ctx->is_vectorized()
+      && id_proj_expr->is_batch_result()
+      && (!iter_param_->need_project_relevance() || relevance_proj_expr->is_batch_result())) {
+    // Batch form of the per-row projection below: the datums of rows [0, count) are located
+    // once, filled in a tight loop, and the evaluated flags are set for the whole range.
+    // 作者：FDE WorkMate
+    const ObDocIdExt *ids = buffered_domain_ids_.get_data();
+    ObDatum *id_datums = id_proj_expr->locate_datums_for_update(*eval_ctx, count);
+    if (common::ObUInt64Type == id_proj_expr->datum_meta_.type_) {
+      for (int64_t i = 0; i < count; ++i) {
+        id_datums[i].set_int(ids[i].get_datum().get_int());
+      }
+    } else {
+      for (int64_t i = 0; i < count; ++i) {
+        id_datums[i].set_datum(ids[i].get_datum());
+      }
+    }
+    id_proj_expr->get_evaluated_flags(*eval_ctx).set_all(count);
+    id_proj_expr->set_evaluated_projected(*eval_ctx);
+    if (iter_param_->need_project_relevance()) {
+      const double *relevances = buffered_relevances_.get_data();
+      ObDatum *relevance_datums = relevance_proj_expr->locate_datums_for_update(*eval_ctx, count);
+      for (int64_t i = 0; i < count; ++i) {
+        relevance_datums[i].set_double(relevances[i]);
+      }
+      relevance_proj_expr->get_evaluated_flags(*eval_ctx).set_all(count);
+      relevance_proj_expr->set_evaluated_projected(*eval_ctx);
+    }
+  } else if (eval_ctx->is_vectorized()) {
     sql::ObBitVector &id_evaluated_flags = id_proj_expr->get_evaluated_flags(*eval_ctx);
     for (int64_t i = 0; i < count; ++i) {
       guard.set_batch_idx(i);

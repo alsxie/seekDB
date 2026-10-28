@@ -46,6 +46,21 @@ struct ObSRMergeCmp
 
   int init(sql::ObDatumMeta id_meta, const ObFixedArray<const ObDatum *, ObIAllocator> *iter_ids);
   int cmp(const ObSRMergeItem &l, const ObSRMergeItem &r, int64_t &cmp_ret);
+  // Compares two ids directly, for merge loops that track the id datums themselves.
+  // 作者：FDE WorkMate
+  OB_INLINE int cmp_id(const ObDatum &l_id, const ObDatum &r_id, int64_t &cmp_ret) const
+  {
+    int ret = OB_SUCCESS;
+    if (is_binary_str_) {
+      cmp_ret = bytewise_null_first_cmp(l_id, r_id);
+    } else {
+      int tmp_ret = 0;
+      if (OB_SUCC(cmp_func_(l_id, r_id, tmp_ret, nullptr))) {
+        cmp_ret = tmp_ret;
+      }
+    }
+    return ret;
+  }
 private:
   inline const ObDatum &get_id_datum(const int64_t iter_idx)
   {
@@ -103,7 +118,7 @@ protected:
   // heads instead of the heap and the relevance collector.  Subclasses that rely on the per-row
   // hooks above must not enable it.  作者：FDE WorkMate
   int init_unscored_merge();
-  int do_one_unscored_merge_round(int64_t &count);
+  int fill_unscored_batch(const int64_t capacity, int64_t &count);
   static const int64_t UNSCORED_LINEAR_MERGE_MAX_DIM = 8;
 protected:
   ObIAllocator *iter_allocator_;

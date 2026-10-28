@@ -501,17 +501,25 @@ int ObTextRetrievalDaaTTokenIter::get_next_row() {
 int ObTextRetrievalDaaTTokenIter::save_relevances_and_docids()
 {
   int ret = OB_SUCCESS;
-  if (OB_ISNULL(relevance_expr_) || OB_ISNULL(inv_scan_domain_id_col_)) {
+  const sql::ObBitVector *skip = nullptr;
+  if (OB_ISNULL(relevance_expr_) || OB_ISNULL(inv_scan_domain_id_col_)
+      || OB_ISNULL(skip = token_iter_->get_skip())) {
     ret = OB_INVALID_ARGUMENT;
-  } else if (OB_FAIL(relevance_expr_->eval_batch(*eval_ctx_, *token_iter_->get_skip(), count_))) {
+  } else if (OB_UNLIKELY(count_ > doc_id_.count() || count_ > relevance_.count())) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("batch larger than buffers", K(ret), K_(count), K(doc_id_.count()), K(relevance_.count()));
+  } else if (OB_FAIL(relevance_expr_->eval_batch(*eval_ctx_, *skip, count_))) {
   } else {
     cur_idx_ = 0;
     const ObDatumVector &relevance_datum = relevance_expr_->locate_expr_datumvector(*eval_ctx_);
     const ObDatumVector &doc_id_datum = inv_scan_domain_id_col_->locate_expr_datumvector(*eval_ctx_);
+    ObDocIdExt *doc_ids = doc_id_.get_data();
+    double *relevances = relevance_.get_data();
+    const bool no_skip = skip->is_all_false(count_);
     for (int64_t i = 0; OB_SUCC(ret) && i < count_; ++i) {
-      if (OB_LIKELY(!token_iter_->get_skip()->at(i))) {
-        relevance_[i] = relevance_datum.at(i)->get_double();
-        if (OB_FAIL(doc_id_[i].from_datum(*doc_id_datum.at(i)))) {
+      if (OB_LIKELY(no_skip || !skip->at(i))) {
+        relevances[i] = relevance_datum.at(i)->get_double();
+        if (OB_FAIL(doc_ids[i].from_datum(*doc_id_datum.at(i)))) {
         }
       }
     }
@@ -519,18 +527,27 @@ int ObTextRetrievalDaaTTokenIter::save_relevances_and_docids()
   return ret;
 }
 
+// Both savers run once per posting: the skip vector is tested once per batch (rows skipped by the
+// scan keep their previous content, as before) and the buffers are filled through raw pointers.
+// 作者：FDE WorkMate
 int ObTextRetrievalDaaTTokenIter::save_docids()
 {
   int ret = OB_SUCCESS;
-  if (OB_ISNULL(inv_scan_domain_id_col_)) {
+  const sql::ObBitVector *skip = nullptr;
+  if (OB_ISNULL(inv_scan_domain_id_col_) || OB_ISNULL(skip = token_iter_->get_skip())) {
     ret = OB_INVALID_ARGUMENT;
+  } else if (OB_UNLIKELY(count_ > doc_id_.count())) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("batch larger than doc id buffer", K(ret), K_(count), K(doc_id_.count()));
   } else {
     cur_idx_ = 0;
     const ObDatumVector &doc_id_datum = inv_scan_domain_id_col_->locate_expr_datumvector(*eval_ctx_);
+    ObDocIdExt *doc_ids = doc_id_.get_data();
+    const bool no_skip = skip->is_all_false(count_);
     for (int64_t i = 0; OB_SUCC(ret) && i < count_; ++i) {
-      if (OB_LIKELY(!token_iter_->get_skip()->at(i))) {
-        if (OB_FAIL(doc_id_[i].from_datum(*doc_id_datum.at(i)))) {
-        };
+      if (OB_LIKELY(no_skip || !skip->at(i))) {
+        if (OB_FAIL(doc_ids[i].from_datum(*doc_id_datum.at(i)))) {
+        }
       }
     }
   }
@@ -591,10 +608,10 @@ int ObTextRetrievalDaaTTokenIter::get_curr_score(double &score) const
 int ObTextRetrievalDaaTTokenIter::get_curr_id(const ObDatum *&id_datum) const
 {
   int ret = OB_SUCCESS;
-  if (OB_UNLIKELY(cur_idx_ >= count_)) {
+  if (OB_UNLIKELY(cur_idx_ < 0 || cur_idx_ >= count_ || count_ > doc_id_.count())) {
     ret = OB_ARRAY_OUT_OF_RANGE;
   } else {
-    id_datum = &doc_id_[cur_idx_].get_datum();
+    id_datum = &doc_id_.get_data()[cur_idx_].get_datum();
   }
   return ret;
 }

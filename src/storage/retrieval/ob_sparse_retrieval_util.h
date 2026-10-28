@@ -34,15 +34,48 @@ OB_INLINE bool is_bytewise_comparable_id(const ObObjType type, const ObCollation
   return ob_is_string_type(type) && CS_TYPE_BINARY == cs_type && !is_lob_storage(type);
 }
 
+// memcmp order on the common length, then the shorter string first; the result is -1, 0 or 1.
+// Doc ids are a few machine words long, so they are compared a word at a time (a big-endian
+// word compare equals a byte compare) instead of calling memcmp for every merge step.
+// 作者：FDE WorkMate
+OB_INLINE int bytewise_cmp(const char *l, const uint32_t l_len, const char *r, const uint32_t r_len)
+{
+  const uint32_t len = MIN(l_len, r_len);
+  uint32_t pos = 0;
+  int cmp_ret = 0;
+  for (; 0 == cmp_ret && pos + sizeof(uint64_t) <= len; pos += sizeof(uint64_t)) {
+    uint64_t l_word = 0;
+    uint64_t r_word = 0;
+    memcpy(&l_word, l + pos, sizeof(uint64_t));
+    memcpy(&r_word, r + pos, sizeof(uint64_t));
+    if (l_word != r_word) {
+#if defined(__BYTE_ORDER__) && (__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__)
+      l_word = __builtin_bswap64(l_word);
+      r_word = __builtin_bswap64(r_word);
+#endif
+      cmp_ret = l_word < r_word ? -1 : 1;
+    }
+  }
+  for (; 0 == cmp_ret && pos < len; ++pos) {
+    const unsigned char l_ch = static_cast<unsigned char>(l[pos]);
+    const unsigned char r_ch = static_cast<unsigned char>(r[pos]);
+    if (l_ch != r_ch) {
+      cmp_ret = l_ch < r_ch ? -1 : 1;
+    }
+  }
+  if (0 == cmp_ret && l_len != r_len) {
+    cmp_ret = l_len < r_len ? -1 : 1;
+  }
+  return cmp_ret;
+}
+
 OB_INLINE int bytewise_null_first_cmp(const ObDatum &l, const ObDatum &r)
 {
   int cmp_ret = 0;
   if (OB_UNLIKELY(l.is_null() || r.is_null())) {
     cmp_ret = l.is_null() ? (r.is_null() ? 0 : -1) : 1;
   } else {
-    const uint32_t len = MIN(l.len_, r.len_);
-    const int c = 0 == len ? 0 : memcmp(l.ptr_, r.ptr_, len);
-    cmp_ret = 0 != c ? c : static_cast<int>(l.len_) - static_cast<int>(r.len_);
+    cmp_ret = bytewise_cmp(l.ptr_, l.len_, r.ptr_, r.len_);
   }
   return cmp_ret;
 }

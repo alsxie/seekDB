@@ -46,7 +46,10 @@
 
 - 只用作过滤条件的 MATCH：自然语言模式下 BM25 分数在命中时恒 > 0，过滤结果等价于“是否命中”，跳过相关度计算（`relevance_only_for_match_filter_`）。
 - 无分数、无投影、无过滤且任一维命中即有效时，倒排列表合并改为对 ≤8 个维度头做线性最小值扫描（unscored merge，`ob_sparse_daat_iter.cpp`），绕过堆和相关度 collector。
-- doc id（varbinary）比较内联 memcmp，避免逐次走 collation 函数表（`ob_sparse_retrieval_util.h`）。
+- unscored merge 按批填充（`fill_unscored_batch`）：一次调用产出整批结果，裸指针访问维度头，id 比较内联，offset/limit 在原处处理，输出顺序与堆合并相同。
+- doc id（varbinary）比较内联，按 8 字节大端字比较（结果与 memcmp 序相同），避免逐次走 collation 函数表（`ob_sparse_retrieval_util.h`）。
+- 倒排扫描保存 doc id 时每批只检查一次 skip 向量（`ob_text_retrieval_token_iter.cpp`）；结果投影在向量化且表达式为批结果时整批定位 datum、整段置 evaluated 标志（`project_results`）。
+- string diff 编码的定长列解码快路径（`ob_string_diff_decoder.cpp`）：公共字节先拼成模板，每行一次模板拷贝加各差异段，用定长搬移代替逐段 libc memcpy；布局超出限制（串长 >32、差异段 >8、描述符未覆盖全串、hex packing、变长）时走原路径。用双路径自校验构建（快路径与原路径逐行比较，不一致即中止）跑完用例集、模糊测试和 benchmark，共校验 2782 万行，0 不一致；自校验补丁不随代码提交。
 - 有 LIMIT 下推且只需“是否命中”时保持 DaaT 流式，命中够数即停（`ob_das_iter_utils.cpp`）。
 - 父查询不读取列的 LIMIT 视图（如 `select count(*) from (... match ... limit k) v`）：不再追加隐式相关度排序，并裁剪无用投影，避免回表（`ob_transform_pre_process.cpp`）。
 
