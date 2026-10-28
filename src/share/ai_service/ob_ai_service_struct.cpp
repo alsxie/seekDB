@@ -368,6 +368,18 @@ const char *AiColumnUtil::row_state_str(const int64_t state)
   return str;
 }
 
+static int64_t ai_task_write_epoch = 0;
+
+void AiColumnUtil::notify_task_written()
+{
+  (void)ATOMIC_AAF(&ai_task_write_epoch, 1);
+}
+
+int64_t AiColumnUtil::get_task_write_epoch()
+{
+  return ATOMIC_LOAD(&ai_task_write_epoch);
+}
+
 int64_t AiColumnUtil::calc_spec_version(const ObString &normalized_expr)
 {
   uint64_t hash = murmurhash64A(normalized_expr.ptr(), normalized_expr.length(), 0);

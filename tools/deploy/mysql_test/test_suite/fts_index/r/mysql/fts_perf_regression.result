@@ -86,6 +86,81 @@ select id from docs where match(content) against('topk limit') order by match(co
 | 30 |
 +----+
 
+select count(*) from (select id from docs where match(content) against('倒排索引 tokenizer') limit 3) t;
++----------+
+| count(*) |
++----------+
+|        3 |
++----------+
+select count(*) from (select id from docs where match(content) against('倒排索引 tokenizer') limit 100) t;
++----------+
+| count(*) |
++----------+
+|      100 |
++----------+
+select count(*) from (select id from docs where match(content) against('倒排索引 tokenizer') limit 1, 2) t;
++----------+
+| count(*) |
++----------+
+|        2 |
++----------+
+select 1 from (select id from docs where match(content) against('倒排索引 tokenizer') limit 2) t;
++---+
+| 1 |
++---+
+| 1 |
+| 1 |
++---+
+select count(*) from (select id from docs where match(content) against('BM25 relevance') limit 3) t where id > 0;
++----------+
+| count(*) |
++----------+
+|        3 |
++----------+
+select max(id) is not null from (select id from docs where match(content) against('BM25 relevance') limit 1) t;
++---------------------+
+| max(id) is not null |
++---------------------+
+|                   1 |
++---------------------+
+
+select tokenize('OceanBase 是一款 数据库 search engine', 'ik');
++-----------------------------------------------------------------+
+| tokenize('OceanBase 是一款 数据库 search engine', 'ik')         |
++-----------------------------------------------------------------+
+| ["engine", "oceanbase", "是", "数据库", "一款", "search"]       |
++-----------------------------------------------------------------+
+select tokenize('OceanBase 是一款 数据库 search engine', 'ik', '[{"additional_args":[{"ik_mode":"max_word"}]}]');
++-----------------------------------------------------------------------------------------------------------------+
+| tokenize('OceanBase 是一款 数据库 search engine', 'ik', '[{"additional_args":[{"ik_mode":"max_word"}]}]')       |
++-----------------------------------------------------------------------------------------------------------------+
+| ["数据", "engine", "oceanbase", "是", "数据库", "款", "一", "一款", "search", "库"]                             |
++-----------------------------------------------------------------------------------------------------------------+
+select tokenize('OceanBase 是一款 数据库 search engine', 'ik');
++-----------------------------------------------------------------+
+| tokenize('OceanBase 是一款 数据库 search engine', 'ik')         |
++-----------------------------------------------------------------+
+| ["engine", "oceanbase", "是", "数据库", "一款", "search"]       |
++-----------------------------------------------------------------+
+select tokenize('OceanBase 是一款 数据库 search engine', 'beng');
++-----------------------------------------------------------------+
+| tokenize('OceanBase 是一款 数据库 search engine', 'beng')       |
++-----------------------------------------------------------------+
+| ["engine", "oceanbase", "是一款", "数据库", "search"]           |
++-----------------------------------------------------------------+
+select tokenize('OceanBase 是一款 数据库 search engine', 'ngram');
++------------------------------------------------------------------------------------------------------------------------------------------+
+| tokenize('OceanBase 是一款 数据库 search engine', 'ngram')                                                                               |
++------------------------------------------------------------------------------------------------------------------------------------------+
+| ["ea", "数据", "oc", "ce", "in", "se", "是一", "ba", "ar", "ch", "据库", "ne", "gi", "nb", "an", "en", "ng", "rc", "as", "一款"]         |
++------------------------------------------------------------------------------------------------------------------------------------------+
+select tokenize('OceanBase 是一款 数据库 search engine', 'ik', '[{"output": "all"}]');
++-------------------------------------------------------------------------------------------------------------------------+
+| tokenize('OceanBase 是一款 数据库 search engine', 'ik', '[{"output": "all"}]')                                          |
++-------------------------------------------------------------------------------------------------------------------------+
+| {"tokens": [{"engine": 1}, {"oceanbase": 1}, {"是": 1}, {"数据库": 1}, {"一款": 1}, {"search": 1}], "doc_len": 6}       |
++-------------------------------------------------------------------------------------------------------------------------+
+
 select count(*) from docs where match(title, content) against('OceanBase 数据库 中文 noise 其它 search');
 +----------+
 | count(*) |

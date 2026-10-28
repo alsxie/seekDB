@@ -218,6 +218,8 @@ int AiColumnTaskHandle::do_handle(ObTableModifyOp &op, const ObDMLBaseCtDef &dml
       op.get_exec_ctx().get_das_ctx().is_fk_cascading_ = true;
       if (OB_FAIL(op.execute_write(stmt.ptr()))) {
         LOG_WARN("fail to maintain ai column task", K(ret), K(stmt));
+      } else if (1 == round) {
+        share::AiColumnUtil::notify_task_written();
       }
       op.get_exec_ctx().get_das_ctx().is_fk_cascading_ = save_cascading;
       int end_ret = op.end_nested_session();

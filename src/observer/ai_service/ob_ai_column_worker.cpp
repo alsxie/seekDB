@@ -142,7 +142,15 @@ void ObAiColumnWorker::run1()
 {
   lib::set_thread_name("AiColumnWorker");
   const int64_t thread_idx = static_cast<int64_t>(get_thread_idx());
+  // idle bookkeeping is per thread: each thread owns a disjoint share of the task table
+  bool is_idle = false;
+  int64_t idle_epoch = 0;
+  int64_t last_round_ts = 0;
   while (!has_set_stop()) {
+    const int64_t now = ObTimeUtility::current_time();
+    const int64_t epoch = AiColumnUtil::get_task_write_epoch();
+    const bool can_skip = is_idle && epoch == idle_epoch
+                          && now - last_round_ts < IDLE_POLL_INTERVAL_US;
     if (SS_SERVING != GCTX.status_ || OB_ISNULL(GCTX.sql_proxy_)) {
     } else if (!recovered_) {
       // tasks leased before a restart belong to nobody: thread 0 releases them first
@@ -154,9 +162,16 @@ void ObAiColumnWorker::run1()
           recovered_ = true;
         }
       }
+    } else if (can_skip) {
+      // nothing to do until new task rows are written
     } else {
-      int tmp_ret = run_once(thread_idx);
+      last_round_ts = now;
+      // read the epoch before looking at the table, so a write racing with this round
+      // always wakes the thread up again
+      idle_epoch = epoch;
+      int tmp_ret = run_once(thread_idx, is_idle);
       if (OB_SUCCESS != tmp_ret) {
+        is_idle = false;
         LOG_WARN_RET(tmp_ret, "ai column worker round failed");
       }
       if (0 == thread_idx && ObTimeUtility::current_time() - last_gc_ts_ > GC_INTERVAL_US) {
@@ -186,12 +201,19 @@ int ObAiColumnWorker::recover_leases()
   return ret;
 }
 
-int ObAiColumnWorker::run_once(const int64_t thread_idx)
+int ObAiColumnWorker::run_once(const int64_t thread_idx, bool &is_idle)
 {
   int ret = OB_SUCCESS;
   ObArenaAllocator allocator("AiColWorker");
   ObSEArray<Task, CLAIM_BATCH> tasks;
+  bool exists = true;
+  is_idle = false;
   if (OB_FAIL(fetch_tasks(allocator, thread_idx, tasks))) {
+  } else if (!tasks.empty()) {
+  } else if (OB_FAIL(has_any_task(thread_idx, exists))) {
+  } else {
+    // waiting tasks (retry backoff, live leases) keep the thread polling
+    is_idle = !exists;
   }
   for (int64_t i = 0; OB_SUCC(ret) && !has_set_stop() && i < tasks.count(); ++i) {
     bool claimed = false;
@@ -200,6 +222,31 @@ int ObAiColumnWorker::run_once(const int64_t thread_idx)
       LOG_WARN("fail to claim ai column task", K(tmp_ret), K(tasks.at(i)));
     } else if (claimed && OB_SUCCESS != (tmp_ret = process(allocator, tasks.at(i)))) {
       LOG_WARN("fail to process ai column task", K(tmp_ret), K(tasks.at(i)));
+    }
+  }
+  return ret;
+}
+
+int ObAiColumnWorker::has_any_task(const int64_t thread_idx, bool &exists)
+{
+  int ret = OB_SUCCESS;
+  ObSqlString sql;
+  exists = true;
+  if (OB_FAIL(sql.append_fmt("SELECT 1 FROM %s.%s WHERE MOD(request_id, %ld) = %ld LIMIT 1",
+                             OB_SYS_DATABASE_NAME, TASK_TABLE, get_thread_count(), thread_idx))) {
+  } else {
+    SMART_VAR(ObMySQLProxy::MySQLResult, res) {
+      ObMySQLResult *result = NULL;
+      if (OB_FAIL(GCTX.sql_proxy_->read(res, sql.ptr()))) {
+        LOG_WARN("fail to probe ai column tasks", K(ret), K(sql));
+      } else if (OB_ISNULL(result = res.get_result())) {
+        ret = OB_ERR_UNEXPECTED;
+      } else if (OB_SUCC(result->next())) {
+        exists = true;
+      } else if (OB_ITER_END == ret) {
+        ret = OB_SUCCESS;
+        exists = false;
+      }
     }
   }
   return ret;

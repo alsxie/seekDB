@@ -49,6 +49,9 @@ public:
 
   // knobs, shared with tests
   static const int64_t POLL_INTERVAL_US = 100 * 1000;
+  // An idle thread (its share of the task table is empty) only wakes up early when task rows
+  // are written; this interval is the safety net for writes it could not observe.
+  static const int64_t IDLE_POLL_INTERVAL_US = 2 * 1000 * 1000;
   static const int64_t LEASE_SECONDS = 60;
   static const int64_t BASE_BACKOFF_US = 1000 * 1000;
   static const int64_t MAX_BACKOFF_US = 60 * 1000 * 1000;
@@ -85,7 +88,8 @@ private:
   };
 
   ObAiColumnWorker() : last_gc_ts_(0), recovered_(false) {}
-  int run_once(const int64_t thread_idx);
+  int run_once(const int64_t thread_idx, bool &is_idle);
+  int has_any_task(const int64_t thread_idx, bool &exists);
   int recover_leases();
   int fetch_tasks(common::ObIAllocator &allocator, const int64_t thread_idx,
                   common::ObIArray<Task> &tasks);
