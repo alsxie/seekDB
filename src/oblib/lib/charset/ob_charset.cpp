@@ -2042,7 +2042,7 @@ int ObCharset::is_mbchar(const ObCollationType collation_type, const char *str, 
   return ret;
 }
 
-const ObCharsetInfo *ObCharset::get_charset(const ObCollationType collation_type)
+const ObCharsetInfo *ObCharset::get_charset_slow(const ObCollationType collation_type)
 {
   ObCharsetInfo *ret = NULL;
   if (OB_UNLIKELY(collation_type <= CS_TYPE_INVALID ||
@@ -2170,7 +2170,8 @@ inline bool ObCharset::is_argument_valid(const ObCollationType &collation_type, 
 {
   bool is_arg_valid = true;
   if (OB_LIKELY(collation_type > CS_TYPE_INVALID && collation_type < CS_TYPE_MAX
-              && OB_NOT_NULL(get_charset_uninit(collation_type)))) {
+              && (OB_NOT_NULL(charset_arr_inited[collation_type])
+                  || OB_NOT_NULL(get_charset_uninit(collation_type))))) {
     if (OB_UNLIKELY(str_len1 < 0) ||
       OB_UNLIKELY(str_len2 < 0) ||
       (OB_ISNULL(str1) && OB_UNLIKELY(0 != str_len1)) ||

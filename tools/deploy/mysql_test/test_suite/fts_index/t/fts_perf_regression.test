@@ -1,0 +1,75 @@
+# owner: FDE WorkMate
+# owner group: storage
+# description: result-equivalence guards for the fulltext performance changes
+#   (parallel index build, binary doc id compare, relevance skip for bare MATCH filters,
+#    sorted range dict / charset fast paths used by IK, utf8mb4 general_ci prefix skip).
+# 作者：FDE WorkMate
+
+--disable_warnings
+drop database if exists fts_perf_reg;
+create database fts_perf_reg;
+use fts_perf_reg;
+--enable_warnings
+
+--result_format 4
+
+create table docs(
+  id int primary key,
+  title varchar(255),
+  content varchar(1024),
+  tag varchar(64)) default charset utf8mb4 collate utf8mb4_general_ci;
+
+--disable_query_log
+let $i = 1;
+while ($i <= 400)
+{
+  let $m = `select $i % 7`;
+  if ($m == 0) { eval insert into docs values($i, 'OceanBase 全文索引 第$i篇', '倒排索引 tokenizer 分词器 三个 2024年 Search engine doc$i', 'Alpha'); }
+  if ($m == 1) { eval insert into docs values($i, '数据库 优化 $i', '分词器 热路径 parser reuse fulltext search index $i', 'alpha '); }
+  if ($m == 2) { eval insert into docs values($i, 'search tuning $i', 'BM25 relevance score topk limit query $i', 'ALPHA'); }
+  if ($m == 3) { eval insert into docs values($i, '中文 分词 $i', '中华人民共和国 五千 个 公斤 一百二十三 倒排索引', 'beta'); }
+  if ($m == 4) { eval insert into docs values($i, 'mixed 混合 $i', 'tokenizer 全文索引 OceanBase search 分词器', 'Beta'); }
+  if ($m == 5) { eval insert into docs values($i, 'noise $i', 'nothing relevant here at all $i', 'gamma'); }
+  if ($m == 6) { eval insert into docs values($i, '其它 $i', '无关 内容 文本 $i', 'GAMMA '); }
+  inc $i;
+}
+--enable_query_log
+
+# index build runs through the (possibly parallel) DDL builder
+create fulltext index ft_ik on docs(title, content) with parser ik;
+create fulltext index ft_beng on docs(content) with parser beng;
+
+# bare MATCH filter (relevance may be skipped) must return the same rows as the scored forms
+select count(*) from docs where match(title, content) against('全文索引 分词器');
+select count(*) from docs where match(title, content) against('全文索引 分词器') > 0;
+select count(*) from (select id, match(title, content) against('全文索引 分词器') s from docs
+                      where match(title, content) against('全文索引 分词器')) t where s > 0;
+select count(*) from docs where match(content) against('search tokenizer');
+select count(*) from docs where match(content) against('+search -tokenizer' in boolean mode);
+select id from docs where match(content) against('倒排索引 tokenizer') order by id limit 10;
+select count(*), min(id), max(id), sum(id) from docs where match(title, content) against('OceanBase search');
+
+# score still projected when it is used
+select id, round(match(content) against('BM25 relevance') , 4) as s from docs
+  where match(content) against('BM25 relevance') order by s desc, id limit 5;
+select id from docs where match(content) against('topk limit') order by match(content) against('topk limit') desc, id limit 5;
+
+# multi-token merge over binary doc ids
+select count(*) from docs where match(title, content) against('OceanBase 数据库 中文 noise 其它 search');
+
+# IK tokenizer: quantifiers, CN numbers, dictionary words, smart and max_word modes
+select tokenize('中华人民共和国 五千 个 公斤 一百二十三 2024年 三个 倒排索引', 'ik');
+select tokenize('中华人民共和国 五千 个 公斤 一百二十三 2024年 三个 倒排索引', 'ik', '[{"additional_args":[{"ik_mode":"max_word"}]}]');
+select tokenize('OceanBase 是一款 数据库 search engine', 'beng');
+select tokenize(content, 'ik') from docs where id in (1, 3) order by id;
+
+# utf8mb4_general_ci comparison: shared prefixes, case, accents, trailing spaces
+select count(*) from (select tag from docs group by tag) g;
+select count(*) from docs where tag = 'ALPHA';
+select 'abcdef' = 'ABCDEF', 'abcdef' < 'abcdeg', 'abc' = 'abc   ', 'résumé' = 'RESUME',
+       'OceanBase全文' = 'oceanbase全文', 'OceanBase全文' < 'OceanBase全斗', 'ab' < 'abc',
+       strcmp('前缀相同后缀a', '前缀相同后缀B'), strcmp('xyz', 'xyz') from dual;
+select count(distinct tag) from docs where tag in ('alpha', 'beta');
+
+drop table docs;
+drop database fts_perf_reg;
