@@ -61,26 +61,31 @@ B2：
 
 ① 中的采样修复使 A4 构建项由 45.5% 升到 53.0%（同会话对照 475d8cca）；② 只改变受配额限制的形态，A4 持平，B2 构建项由 33.8% 升到 41.2%。
 
-本次 ③ 在 N95（4 核，7.5 GB，governor=performance）上与 ② 同会话交替对照，每次全新实例运行官方脚本，参数与 CI 相同：
+本次 ③ 在 N95（4 核，7.5 GB，governor=performance）上与 ② 同会话交替对照，每次全新实例运行官方脚本，参数与 CI 相同。综合值用官方 `fts_large_bench_score.py` 复算（基线换成同会话基线均值），与本地统计一致。4 核共跑 5 轮，其中 1 轮三个二进制同时变慢（基线 build_ik_all 15.9 s，其余轮次 11.7~12.0 s），按机器干扰剔除。
+
+4 核（4 轮）：
 
 | 指标 | 基线 | ② | ③ | ③ 较 ② 耗时变化 |
 |---|---|---|---|---|
-| build_ik_all_sec | 11.758 | 4.983 | 4.865 | -2.4% |
-| build_ik_content_sec | 9.208 | 5.752 | 5.253 | -8.7% |
-| build_beng_en_sec | 4.796 | 2.865 | 2.673 | -6.7% |
-| tokenize_ik_avg_ms | 0.1577 | 0.1313 | 0.1226 | -6.6% |
-| tokenize_beng_avg_ms | 0.0910 | 0.0848 | 0.0813 | -4.1% |
-| query_cn_avg_ms | 2.552 | 0.863 | 0.861 | -0.3% |
-| query_beng_avg_ms | 3.786 | 1.209 | 1.206 | -0.3% |
-| query_mixed_avg_ms | 2.845 | 1.028 | 1.015 | -1.2% |
-| query_limit_avg_ms | 3.354 | 0.340 | 0.341 | 0.4% |
+| build_ik_all_sec | 11.858 | 5.301 | 4.858 | -8.3% |
+| build_ik_content_sec | 9.385 | 5.897 | 5.403 | -8.4% |
+| build_beng_en_sec | 4.973 | 2.974 | 2.773 | -6.8% |
+| tokenize_ik_avg_ms | 0.1638 | 0.1370 | 0.1253 | -8.5% |
+| tokenize_beng_avg_ms | 0.0939 | 0.0867 | 0.0839 | -3.2% |
+| query_cn_avg_ms | 2.607 | 0.871 | 0.865 | -0.6% |
+| query_beng_avg_ms | 3.921 | 1.202 | 1.205 | 0.2% |
+| query_mixed_avg_ms | 2.961 | 1.029 | 1.023 | -0.6% |
+| query_limit_avg_ms | 3.501 | 0.348 | 0.346 | -0.8% |
 
-| 形态 | ② 综合（构建/分词/查询） | ③ 综合（构建/分词/查询） |
-|---|---|---|
-| 4 核，2 轮 | 42.96（45.1 / 11.8 / 72.0） | 45.74（48.6 / 16.4 / 72.1） |
-| `taskset` 2 核，1 轮 | 37.72（25.7 / 14.1 / 73.4） | 41.09（28.6 / 20.5 / 74.2） |
+三种 CPU 形态的综合下降（%）：
 
-③ 只减少单线程 CPU，两种形态都提升约 3 个综合点；N95 与 ss144 的绝对值不同，只比较同机差值。
+| 形态 | 轮数 | ② 综合（构建/分词/查询） | ③ 综合（构建/分词/查询） | 差值 |
+|---|---|---|---|---|
+| 4 核 | 4 | 43.01（44.2 / 12.0 / 72.8） | 46.19（48.6 / 17.1 / 72.9） | +3.2 |
+| `taskset -c 0,1` | 3 | 38.12（25.8 / 14.2 / 74.4） | 41.75（30.2 / 20.3 / 74.8） | +3.6 |
+| cgroup 配额 2 核（`systemd-run -p CPUQuota=200%`，可见 4 核） | 3 | 39.49（31.3 / 13.8 / 73.3） | 44.84（41.7 / 19.4 / 73.4） | +5.4 |
+
+每种形态下 ③ 的逐轮综合值都高于 ② 的逐轮最大值。配额形态下服务端日志为 `available_cpu_num=2, parallelism=1`，② 中按配额计算的并行度生效；此时每张倒排表只有 1 个 worker，IK 分词在关键路径上，③ 的逐字符优化对构建项作用最大。
 
 ## 瓶颈依据与修改点
 
@@ -105,11 +110,11 @@ B2：
   - DAT 字符码查找直接用 key 字节探测（`ob_ft_dat_dict.cpp`）；
   - IK 仲裁器 chain map 去掉线程锁。
 - 本次 ③（perf：tok_ik 每条语句服务端约 45 µs，`tokenize_fulltext` 内 IK 主循环约 57%、DAT `match_with_hit` 约 13.5%、词频合并与停用词约 18%、parser 初始化约 8%）：
-  - DAT 字符码索引（`ob_ft_dat_dict.{h,cpp}`）：DAT 建好后在其后追加只读开放寻址表，键为字符字节与长度打包的 32 位整数，负载不超过 50%，一次乘法哈希、通常一次探测；不超过 3 字节的字符走该表，更长的仍走原 `ObArrayHashMap`，两者收录的字符完全相同。另补上 `base + code` 越界判断（越界即无转移）。
+  - DAT 字符码索引（`ob_ft_dat_dict.{h,cpp}`）：DAT 建好后在其后追加只读开放寻址表，键为字符字节与长度打包的 32 位整数，负载不超过 50%，一次乘法哈希、通常一次探测；不超过 3 字节的字符走该表，更长的仍走原 `ObArrayHashMap`，两者收录的字符完全相同。另补上 `base + code` 越界判断（越界即无转移）。内存：一次 IK 分词后 `dict_cache` 由 26.39 MB（8 项）变为 27.18 MB（7 项，不再加载停用词词典），增加 0.79 MB。
   - 范围词典按首字符定位子词典的二分查找改为比较打包的 64 位整数键，顺序与 memcmp 加长度一致（`ob_ft_range_dict.{h,cpp}`）。
   - 字符分类（`ob_ik_char_util.h`）：原实现按字母、阿拉伯数字、中文、其他 CJK、高低代理逐项判断，每项各自解码一次，同一字符最多解码 6 次；改为解码一次后按原顺序判断，代理区只对 UTF-16 判断。中文数字判断由线性扫描码点数组改为 [min, max] 位图（`unicode_utils.cpp`）。
   - IK 仲裁器（`ob_ik_arbitrator.{h,cpp}`）：链表索引由每批新建的哈希表改为按 min_offset 递增的有序数组加二分查找，重复键仍返回 `OB_HASH_EXIST`。
-  - 停用词（`ob_fts_stop_word.cpp`）：`ObHashSet` 默认模式每次查找都加桶读锁；进程内构建一份同桶数、同插入顺序、无锁模式的只读副本，答案相同。
+  - 停用词（`ob_fts_stop_word.cpp`）：`ObHashSet` 默认模式每次查找都加桶读锁；进程内构建一份同桶数、同插入顺序、无锁模式的只读副本，答案相同。副本记录构建时的桶数和 meta（类型与 collation），检查器的桶数或 meta 与之不同时仍查自己的加锁集合。
   - 词频合并（`ob_fts_parser_helper.cpp`）：`groupby_word` 的 `get` + 覆盖 `set` 两次哈希与桶遍历改为 `set_or_update` 一次，回调与原逻辑一致（条目位置不变、key 换成最新的词、次数累加）。
   - `ObFTParser::serialize_to_str` 直接拼接 `name.version`，不经过 vsnprintf，空间不足时仍走原报错路径；`ObIKFTParser::init` 按线程记住上一个 charset 对象对应的 collation（`ObCharset::collation_type` 按名称查表，同一对象结果固定）；IK 停用词词典不再加载，`get_next_token()` 中对它的匹配本来就是注释掉的，加载只是每次初始化多 pin 一组缓存（`ob_ik_ft_parser.cpp`）。
 - 剩余空间小：beng 分词 `eval_tokenize` 只占进程采样的 14.3%，`ObMPQuery::process` 48.7%、sql-nio 25%，每条语句服务端约 33 µs、端到端约 67 µs，固定的语句开销占主导；IK 的 DAT 查找约占 10.5%，每项候选优化收益不超过 1 个综合点。
@@ -131,7 +136,12 @@ B2：
 - 67090 行 TOKENIZE/MATCH dump（分词结果、命中 id、排序、BM25 分数）与基线逐字节一致；最终版本在全容器形态（3 个 worker）与 A4（2 个 worker）下的 dump 也逐字节一致。
 - 差分模糊测试（collation 比较、TOKENIZE、MATCH 各模式、预编译语句、8 会话并发复现）与上一版本输出一致；与基线相比只有基线自身两次运行间也存在的 BM25 浮点漂移和并列重排。
 - 官方用例集 fts_index、vector_index、ai_function、file_sql、ai_column、ddl、table_redefinition：判定为 mysqltest 退出码 0、生成 .out 且与 .result 一致。失败项与基线二进制完全相同，输出逐字节一致（`basic_dml`、`partitioned_simple_query`、`vector_ivf_index_with_filter`、`dump_ddl_mem`，基线本身即不通过，为 plan 参数编号、内部表 id 等环境差异）。
-- 本次 ③：444 条 TOKENIZE（37 段文本，含中英混合、全角、假名、谚文、emoji、超长词、停用词、大小写与重音，× 12 种 parser / 参数组合）与 2047 行建索引后 MATCH 输出，与基线逐字节一致；fts_index 16 个用例全部通过。
+- 本次 ③：
+  - 444 条 TOKENIZE（37 段文本，含中英混合、全角、假名、谚文、emoji、超长词、停用词、大小写与重音，× 12 种 parser / 参数组合）与 2047 行建索引后 MATCH 输出，与基线逐字节一致；
+  - 索引内容：用 `ob_enable_index_direct_select` 全量导出 5 个全文索引（ik ×2、beng、space、ngram）的 12 张辅助表（倒排表、doc_word 表、doc id 映射表），3000 行与 20000 行（与 benchmark 同规模，共约 500 万索引行）两种数据量下与基线逐字节一致，覆盖并行构建与排序比较的改动；
+  - 官方 mysqltest 全部 33 个用例集（203 个用例）在同一实例上顺序执行，192 个通过。失败的 11 个中：
+    - 8 个在基线二进制上同样失败，其中 7 个输出或报错位置与基线相同：`config_test.config`（缺 `config_test_1.sh` 脚本）、`ddl.dump_ddl_mem`、`file_sql.file_sql_basic` / `file_sql_edge`（本机 ssh 主机密钥校验）、`geometry.geometry_index_mysql`、`geometry.geometry_index2_mysql`、`update.update2`；`ai_function.ai_function_enhancement` 需要 mock AI 服务（`0.0.0.0:8000`），优化版与合并前的 6d7e8942f 都停在第 25 行，基线没有 `ai_prompt` 的 JSON 参数支持（来自 12a4eec14 移植的其他赛题），停在第 7 行；
+    - 3 个是同一实例顺序执行时前序用例遗留的状态或合并时机：`fork_table.fork_table_sstable`（前一次合并未结束的告警）、`geometry.geometry_ddl_mysql`（`foreign_key.dml_147` 留下的 `child` 表）、`vector_index.create_table_with_hybrid_vector_index`（前序用例留下的 AI 模型）。三者在不含这些前序用例的新实例上执行时通过；第三个在 6d7e8942f 上按同样顺序执行，reject 文件与优化版逐字节相同。
 
 ## 回归用例
 
@@ -150,3 +160,5 @@ B2：
 ## 注意
 
 构建收益取决于可用 CPU：并行度为 `MIN(4, 可用 CPU/2)`。只有 2 核可用时每张倒排表 1 个 worker（两张表同时构建），构建项收益低于多核形态。
+
+新增头文件 `lib/utility/ob_cpu_limit.h` 已按 `tools/bazel_migration/generate_oblib_header_inventory.py` 的分组登记到 `src/oblib/oblib_header_inventory.bzl`（`oblib_foundation`），供 Bazel 构建使用；CMake 构建不读该文件。

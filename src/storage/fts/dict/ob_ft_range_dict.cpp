@@ -484,6 +484,9 @@ int ObFTRangeDict::build_dict_from_cache(const ObFTCacheRangeContainer &range_co
       range.start_ = dat->start_word_;
       range.end_ = dat->end_word_;
       range.dict_ = dict;
+      // set_word() keeps word_len within the word buffer, which fits in a range key
+      static_assert(static_cast<int64_t>(sizeof(range.start_.word)) <= MAX_RANGE_KEY_LEN,
+                    "range key too short");
       range.start_key_ = range_key(range.start_.word, range.start_.word_len);
       range.end_key_ = range_key(range.end_.word, range.end_.word_len);
       if (OB_FAIL(range_dicts_.push_back(range))) {

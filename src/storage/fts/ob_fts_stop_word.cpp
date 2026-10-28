@@ -32,43 +32,58 @@ namespace
 // The stop word set never changes after init, but ObHashSet's default defend mode takes a bucket
 // read lock on every lookup.  A second set with the same bucket number, the same words in the same
 // order and NoPthreadDefendMode gives exactly the same answers without the lock.  It is built
-// once per process and never freed (it may be used until exit).  作者：FDE WorkMate
+// once per process with the bucket number and meta of the first caller and never freed (it may be
+// used until exit).  A checker whose bucket number or meta differs keeps using its own locked set.
+// 作者：FDE WorkMate
 typedef common::hash::ObHashSet<ObFTWord, common::hash::NoPthreadDefendMode> ObNoLockStopWordSet;
 
-ObNoLockStopWordSet *build_no_lock_stopword_set(const int64_t bucket_num, const ObObjMeta &meta)
+struct ObNoLockStopWords final
+{
+  ObNoLockStopWords(const int64_t bucket_num, const ObObjMeta &meta)
+      : bucket_num_(bucket_num), meta_(meta), set_()
+  {}
+  const int64_t bucket_num_;
+  const ObObjMeta meta_;
+  ObNoLockStopWordSet set_;
+};
+
+ObNoLockStopWords *build_no_lock_stop_words(const int64_t bucket_num, const ObObjMeta &meta)
 {
   int ret = OB_SUCCESS;
-  ObNoLockStopWordSet *set = nullptr;
+  ObNoLockStopWords *words = nullptr;
   void *buf = nullptr;
   const lib::ObMemAttr attr("StopWordSet");
-  if (OB_ISNULL(buf = ob_malloc(sizeof(ObNoLockStopWordSet), attr))) {
+  if (OB_ISNULL(buf = ob_malloc(sizeof(ObNoLockStopWords), attr))) {
     ret = OB_ALLOCATE_MEMORY_FAILED;
     LOG_WARN("fail to alloc no lock stop word set", K(ret));
-  } else if (FALSE_IT(set = new (buf) ObNoLockStopWordSet())) {
-  } else if (OB_FAIL(set->create(bucket_num, "StopWordSet", "StopWordSet"))) {
+  } else if (FALSE_IT(words = new (buf) ObNoLockStopWords(bucket_num, meta))) {
+  } else if (OB_FAIL(words->set_.create(bucket_num, "StopWordSet", "StopWordSet"))) {
     LOG_WARN("fail to create no lock stop word set", K(ret), K(bucket_num));
   } else {
     const int64_t stopword_count = sizeof(ob_stop_word_list) / sizeof(ob_stop_word_list[0]);
     for (int64_t i = 0; OB_SUCC(ret) && i < stopword_count; ++i) {
       ObFTWord stopword(STRLEN(ob_stop_word_list[i]), ob_stop_word_list[i], meta);
-      if (OB_FAIL(set->set_refactored(stopword))) {
+      if (OB_FAIL(words->set_.set_refactored(stopword))) {
         LOG_WARN("fail to add stop word", K(ret), K(i));
       }
     }
   }
-  if (OB_FAIL(ret) && OB_NOT_NULL(set)) {
-    set->~ObNoLockStopWordSet();
+  if (OB_FAIL(ret) && OB_NOT_NULL(words)) {
+    words->~ObNoLockStopWords();
     ob_free(buf);
-    set = nullptr;
+    words = nullptr;
   }
-  return set;
+  return words;
 }
 
-// nullptr if it could not be built, the locked set is used then
+// nullptr if it could not be built or was built for another bucket number or meta, the locked
+// set is used then
 const ObNoLockStopWordSet *get_no_lock_stopword_set(const int64_t bucket_num, const ObObjMeta &meta)
 {
-  static const ObNoLockStopWordSet *set = build_no_lock_stopword_set(bucket_num, meta);
-  return set;
+  static const ObNoLockStopWords *words = build_no_lock_stop_words(bucket_num, meta);
+  return (OB_NOT_NULL(words) && words->bucket_num_ == bucket_num && words->meta_ == meta)
+             ? &words->set_
+             : nullptr;
 }
 } // namespace
 
