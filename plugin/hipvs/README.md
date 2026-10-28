@@ -26,6 +26,38 @@ cmake -S plugin/hipvs -B build/hipvs -DCMAKE_BUILD_TYPE=Release
 cmake --build build/hipvs -j
 ```
 
+### Build against the prebuilt hipVS 1.0.0 packages
+
+Verified in `rocm/dev-ubuntu-24.04:7.2.3-complete` without a GPU (no source changes needed). AMD PyPI ships the C++ libraries and CMake packages; unpack the wheels instead of building hipVS:
+
+```bash
+idx=https://pypi.amd.com/rocm-7.2.3/simple
+pip download --no-deps -d wheels --index-url $idx \
+  amd-libhipvs==1.0.0 amd-libraft==1.0.0 amd-libhipmm==4.0.0 amd-rocmds-logger==1.0.0
+for w in wheels/*.whl; do unzip -q -o "$w" -d deps; done
+apt-get install -y libopenblas-dev   # cuvs::cuvs references /usr/include/openblas and /usr/lib64/libopenblas.so
+ln -sf /usr/lib/x86_64-linux-gnu/libopenblas.so /usr/lib64/libopenblas.so
+```
+
+The raft package also needs two header-only libraries that the wheels do not contain:
+`libhipcxx` 3.0.2 (`ROCm/libhipcxx`, `cmake -S . -B b && cmake --install b --prefix $PWD/../dep-prefix`) and `cuco` 0.4.0
+(`ROCm/hipCollections`, branch `release/rocmds-26.03`). hipCollections downloads its CMake helpers at configure
+time; offline, a `cuco-config.cmake` that defines an INTERFACE `cuco::cuco` target on `include/` and links
+`libhipcxx::libhipcxx` is sufficient. Then:
+
+```bash
+cmake -S plugin/hipvs -B build/hipvs -G Ninja -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_HIP_ARCHITECTURES=gfx1100 \
+  -DCMAKE_CXX_COMPILER=/opt/rocm/llvm/bin/clang++ -DCMAKE_HIP_COMPILER=/opt/rocm/llvm/bin/clang++ \
+  -DCMAKE_PREFIX_PATH="$PWD/dep-prefix;deps/libcuvs/lib64/cmake;deps/libraft/lib64/cmake;deps/librmm/lib64/cmake;deps/rapids_logger/lib64/cmake;/opt/rocm"
+cmake --build build/hipvs -j
+```
+
+At runtime `libseekdb_hipvs.so` needs `libcuvs.so`, `libraft.so`, `librmm.so`, `librapids_logger.so`, ROCm and
+`libopenblas.so.0` on the loader path (`LD_LIBRARY_PATH` of the seekdb process). If any is missing, `dlopen` fails,
+seekDB logs `hipVS enabled but plugin unavailable` once and keeps building on the CPU. Without a usable GPU the
+plugin returns `SEEKDB_HIPVS_BUILD_ERROR` (`hipMemGetInfo failed`) and seekDB also falls back to the CPU.
+
 ## Configuration
 
 Read once when the observer process starts.
