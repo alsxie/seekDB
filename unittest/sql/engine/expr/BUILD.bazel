@@ -4,7 +4,8 @@ load("//bazel:defs.bzl", "cc_library")
 
 package(default_testonly = True)
 
-# Each test source <name>.cpp builds into the test target <name>.
+# Each test source <name>.cpp builds into the test target <name>; the shared
+# ob_expr_test_main.cpp supplies main() so sources may omit it.
 AI_FUNC_TESTS = [
     "ob_expr_ai_prompt_test",
     "test_ob_openai_utils",
@@ -14,6 +15,8 @@ AI_FUNC_TESTS = [
     name = name + "_cases",
     srcs = [
         name + ".cpp",
+        "ob_ai_func_test_utils.h",
+        "ob_expr_test_main.cpp",
         "ob_expr_test_utils.h",
     ],
     alwayslink = True,

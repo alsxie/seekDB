@@ -19,7 +19,7 @@
 // recovery), Ollama native request / response, endpoint provider checks.
 
 #include <gtest/gtest.h>
-#include "ob_expr_test_utils.h"
+#include "ob_ai_func_test_utils.h"
 #include "sql/engine/expr/ob_expr_ai/ob_ai_func_utils.h"
 #include "share/ai_service/ob_ai_service_struct.h"
 
@@ -410,10 +410,4 @@ TEST_F(ObOpenAIUtilsTest, test_endpoint_provider_and_concurrency)
       R"J({"ai_model_name":"m","url":"http://h/v1","access_key":"k","provider":"openai","max_concurrency":1025})J"));
   EXPECT_NE(OB_SUCCESS, endpoint_check(
       R"J({"ai_model_name":"m","url":"http://h/v1","access_key":"k","provider":"openai","max_concurrency":"8"})J"));
-}
-
-int main(int argc, char **argv)
-{
-  ::testing::InitGoogleTest(&argc, argv);
-  return RUN_ALL_TESTS();
 }

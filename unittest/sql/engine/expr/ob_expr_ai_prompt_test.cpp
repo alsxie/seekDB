@@ -18,7 +18,7 @@
 // AI_PROMPT template rendering: JSON args, repeated / nested / illegal placeholders, Unicode.
 
 #include <gtest/gtest.h>
-#include "ob_expr_test_utils.h"
+#include "ob_ai_func_test_utils.h"
 #include "sql/engine/expr/ob_expr_ai/ob_ai_func_utils.h"
 
 using namespace oceanbase::common;
@@ -152,10 +152,4 @@ TEST_F(ObAIPromptTest, test_unicode_and_escape)
   // placeholders inside arguments are not expanded again
   EXPECT_EQ("{1}-x", render_ok(R"J({"template":"{0}-{1}","args":["{1}","x"]})J"));
   EXPECT_EQ("", render_ok(R"J({"template":"{0}","args":[""]})J"));
-}
-
-int main(int argc, char **argv)
-{
-  ::testing::InitGoogleTest(&argc, argv);
-  return RUN_ALL_TESTS();
 }
