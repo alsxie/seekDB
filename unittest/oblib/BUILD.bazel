@@ -4,47 +4,73 @@ load("//bazel:defs.bzl", "cc_library")
 
 package(default_testonly = True)
 
+# Sources go through the project cc_library so they share the oblib compile
+# configuration (C++20, _GLIBCXX_USE_CXX11_ABI=1); cc_test / cc_binary only link.
+_HIPVS_TEST_PLATFORMS = select({
+    "@platforms//os:linux": [],
+    "@platforms//os:macos": [],
+    "//conditions:default": ["@platforms//:incompatible"],
+})
+
+cc_library(
+    name = "hnswlib_stream_fixture",
+    hdrs = ["hnswlib_stream_fixture.h"],
+    includes = ["."],
+)
+
+cc_library(
+    name = "hipvs_mock_plugin_objects",
+    srcs = ["hipvs_mock_plugin.cpp"],
+    alwayslink = True,
+    deps = [
+        ":hnswlib_stream_fixture",
+        "//src/oblib:hipvs_builder_test_support",
+    ],
+    target_compatible_with = _HIPVS_TEST_PLATFORMS,
+)
+
 # GPU-free stand-in for libseekdb_hipvs.so used by test_hipvs_builder.
 cc_binary(
     name = "libhipvs_mock_plugin.so",
-    srcs = [
-        "hipvs_mock_plugin.cpp",
-        "hnswlib_stream_fixture.h",
-    ],
     linkshared = True,
-    deps = ["//src/oblib:hipvs_builder_test_support"],
-    target_compatible_with = select({
-        "@platforms//os:linux": [],
-        "@platforms//os:macos": [],
-        "//conditions:default": ["@platforms//:incompatible"],
-    }),
+    deps = [":hipvs_mock_plugin_objects"],
+    target_compatible_with = _HIPVS_TEST_PLATFORMS,
+)
+
+cc_library(
+    name = "hipvs_builder_cases",
+    srcs = ["test_hipvs_builder.cpp"],
+    alwayslink = True,
+    deps = [
+        ":hnswlib_stream_fixture",
+        "//src/oblib:hipvs_builder_test_support",
+    ],
+    target_compatible_with = _HIPVS_TEST_PLATFORMS,
 )
 
 cc_test(
     name = "test_hipvs_builder",
-    srcs = [
-        "hnswlib_stream_fixture.h",
-        "test_hipvs_builder.cpp",
-    ],
     args = ["$(rootpath :libhipvs_mock_plugin.so)"],
     data = [":libhipvs_mock_plugin.so"],
     linkstatic = True,
-    deps = ["//src/oblib:hipvs_builder_test_support"],
-    target_compatible_with = select({
-        "@platforms//os:linux": [],
-        "@platforms//os:macos": [],
-        "//conditions:default": ["@platforms//:incompatible"],
-    }),
+    deps = [":hipvs_builder_cases"],
+    target_compatible_with = _HIPVS_TEST_PLATFORMS,
+)
+
+cc_library(
+    name = "hnswlib_stream_cases",
+    srcs = ["test_hnswlib_stream.cpp"],
+    alwayslink = True,
+    deps = [
+        ":hnswlib_stream_fixture",
+        "//src/oblib:hipvs_builder_test_support",
+    ],
 )
 
 cc_test(
     name = "test_hnswlib_stream",
-    srcs = [
-        "hnswlib_stream_fixture.h",
-        "test_hnswlib_stream.cpp",
-    ],
     linkstatic = True,
-    deps = ["//src/oblib:hipvs_builder_test_support"],
+    deps = [":hnswlib_stream_cases"],
 )
 
 cc_library(
