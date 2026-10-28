@@ -45,6 +45,7 @@
 #include <limits>
 #include <streambuf>
 #include <string>
+#include <vector>
 
 namespace oceanbase {
 namespace common {
@@ -148,9 +149,11 @@ inline bool parse_header(const char *data, size_t size, Header &header, std::str
   return true;
 }
 
-// Validates the whole stream against what seekDB requested and rewrites the
-// external label of row i to ids[i]. The buffer is modified in place only when the
-// stream is fully valid.
+// Validates the whole stream against what seekDB requested and rewrites each
+// element's external label, which the builder sets to the input row number, to
+// ids[row]. Builders may store elements in any internal order, so the label - not
+// the element position - identifies the row; labels must form a permutation of
+// [0, row_count). The buffer is modified in place only when the stream is fully valid.
 inline bool validate_and_relabel(char *data,
                                  size_t size,
                                  const Expectation &expected,
@@ -245,9 +248,22 @@ inline bool validate_and_relabel(char *data,
     return false;
   }
 
+  std::vector<bool> label_seen(rows, false);
+  for (size_t row = 0; row < rows; ++row) {
+    int64_t label = 0;
+    std::memcpy(&label, data + level0_begin + row * header.size_data_per_element + header.label_offset,
+                sizeof(label));
+    if (label < 0 || static_cast<uint64_t>(label) >= rows || label_seen[static_cast<size_t>(label)]) {
+      error = "hnswlib labels are not a permutation of the input rows";
+      return false;
+    }
+    label_seen[static_cast<size_t>(label)] = true;
+  }
   for (size_t row = 0; row < rows; ++row) {
     char *label = data + level0_begin + row * header.size_data_per_element + header.label_offset;
-    std::memcpy(label, ids + row, sizeof(int64_t));
+    int64_t input_row = 0;
+    std::memcpy(&input_row, label, sizeof(input_row));
+    std::memcpy(label, ids + input_row, sizeof(int64_t));
   }
   return true;
 }

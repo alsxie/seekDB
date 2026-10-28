@@ -8,7 +8,7 @@ Optional plugin that builds seekDB HNSW indexes on AMD Radeon / Instinct GPUs wi
 
 1. `CREATE VECTOR INDEX` / DDL rebuild feeds rows through `ObPluginVectorIndexAdaptor::add_snap_index`. When `obvectorutil::prefer_bulk_build()` reports that the backend wants the whole dataset (GPU enabled, plugin loadable, dense FP32 `hnsw`, `l2`/`ip`, no extra-info), rows are cached instead of being added batch by batch.
 2. `check_snap_hnswsq_index()` (already called before snapshot serialization by both the DDL pipeline and the async rebuild task) creates the index and calls `build_index` once with all rows.
-3. `obvsag::build_index` asks the plugin for an hnswlib stream, validates it completely (header, element layout, every adjacency list, hierarchy, no trailing bytes), rewrites row labels to vector ids and imports it through VSAG `Deserialize` using a seekable in-memory stream.
+3. `obvsag::build_index` asks the plugin for an hnswlib stream, validates it completely (header, element layout, every adjacency list, hierarchy, labels forming a permutation of the input rows, no trailing bytes), rewrites each element's row label to its vector id and imports it through VSAG `Deserialize` using a seekable in-memory stream. Elements may appear in any internal order; the stored label, not the position, identifies the row.
 4. Search, filtering, persistence and incremental updates keep using the existing VSAG HNSW path.
 
 The plugin is loaded once per process and never unloaded. GPU builds are bounded by a process-wide semaphore. The plugin checks free device memory before building and serializes into a `memfd`, so nothing is written to disk.
@@ -46,7 +46,8 @@ export SEEKDB_HIPVS_LIBRARY="$PWD/build/hipvs/libseekdb_hipvs.so"
 
 | Condition | Result |
 | --- | --- |
-| disabled, plugin missing, ABI mismatch | rows added incrementally, CPU path unchanged |
+| disabled | rows added incrementally, CPU path unchanged |
+| enabled but plugin missing or ABI mismatch | rows added incrementally, one `plugin unavailable` warning per process |
 | `cosine`, sparse, SQ/BQ/HGRAPH, extra-info | CPU path unchanged |
 | rows < `SEEKDB_HIPVS_MIN_ROWS` | cached rows built by CPU `build_index` |
 | insufficient GPU memory, plugin error | CPU `build_index`, `hipVS HNSW build failed` warning |
@@ -56,6 +57,9 @@ export SEEKDB_HIPVS_LIBRARY="$PWD/build/hipvs/libseekdb_hipvs.so"
 
 - `[OBVSAG] HNSW build complete path=hipvs|cpu size dim elapsed_us`: same clock and scope for both paths.
 - `[OBVSAG] hipVS HNSW stages`: `queue_wait_us`, `plugin_us`, `cagra_build_us`, `hierarchy_build_us`, `serialize_us`, `validate_us`, `import_us`, device free and estimated bytes.
+- `[OBVSAG] hipVS enabled but plugin unavailable`: logged once with the `dlopen` / ABI reason.
+
+These are INFO / WARN lines; start the observer with `--log-level INFO` to see the completion lines.
 
 ## Benchmark and acceptance
 
@@ -73,5 +77,28 @@ Run on the same host with and without `SEEKDB_HIPVS_ENABLE`, 3 runs each, median
 
 ## Tests without a GPU
 
-- `//unittest/oblib:test_hnswlib_stream`: stream validation, relabeling, rejection of corrupted streams, seekable buffer semantics VSAG relies on.
+- `//unittest/oblib:test_hnswlib_stream`: stream validation, relabeling (including elements stored out of input order), rejection of corrupted streams and non-permutation labels, seekable buffer semantics VSAG relies on.
 - `//unittest/oblib:test_hipvs_builder`: configuration parsing, early exits, mock plugin success, failure / out-of-memory / corrupt / empty / ABI mismatch fallbacks, and the concurrency bound.
+
+## End-to-end pipeline check without a GPU
+
+`tools/hnswlib_reference_plugin.cpp` implements the same plugin ABI with upstream hnswlib v0.8.0 (multithreaded, so elements are stored out of input order like a parallel GPU build). Pointing `SEEKDB_HIPVS_LIBRARY` at it exercises the full seekDB side: bulk snapshot collection, validation, relabeling, VSAG import, persistence and DML. `tools/hnsw_build_bench.py` drives load / build / recall / DML over SQL.
+
+```bash
+SEEKDB_HIPVS_ENABLE=1 SEEKDB_HIPVS_LIBRARY=/path/libseekdb_hnswlib_ref.so seekdb --log-level INFO ...
+python3 tools/hnsw_build_bench.py load  --port P --rows 100000 --metric l2
+python3 tools/hnsw_build_bench.py build --port P --metric l2
+python3 tools/hnsw_build_bench.py query --port P --rows 100000 --metric l2 --ef_search 16 32 64 128
+python3 tools/hnsw_build_bench.py dml   --port P --metric l2
+```
+
+Results on an 8-core x86_64 host without a GPU (100k x 128d Gaussian-mixture data, M=16, ef_construction=200, 200 queries, recall@10 against numpy brute force):
+
+| Metric | Path | `CREATE VECTOR INDEX` (s) | ef=16 | ef=32 | ef=64 | ef=128 |
+| --- | --- | --- | --- | --- | --- | --- |
+| l2 | CPU (switch off) | 28.8 | 0.9760 | 0.9995 | 0.9995 | 0.9995 |
+| l2 | reference plugin | 6.9 | 0.9775 | 0.9995 | 0.9995 | 0.9995 |
+| ip | CPU (switch off) | 30.2 | 0.9745 | 0.9990 | 1.0000 | 1.0000 |
+| ip | reference plugin | 6.7 | 0.9765 | 0.9990 | 1.0000 | 1.0000 |
+
+The build-time gap comes from multithreaded hnswlib versus seekDB's single-threaded incremental insert; it is not a GPU number. Also verified: recall unchanged after observer restart; insert / delete visible after import; plugin failure, out-of-memory, corrupt stream, ABI mismatch, missing library and `SEEKDB_HIPVS_MIN_ROWS` all fall back to CPU with the index usable; `mysql_test/test_suite/vector_index` gives the same results with the switch off and with the reference plugin forced on every HNSW build (`SEEKDB_HIPVS_MIN_ROWS=1`).

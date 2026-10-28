@@ -124,8 +124,10 @@ HipvsPluginRuntime &default_hipvs_runtime();
 
 // True when the process is configured for GPU builds, the data shape is supported
 // and the plugin can be loaded. Callers use it to decide whether to collect the full
-// dataset before building.
-bool hipvs_bulk_build_available(const char *dtype, const char *metric, int64_t extra_info_size);
+// dataset before building. unavailable_reason is non-empty only when GPU builds are
+// enabled and the shape is supported but the plugin cannot be loaded.
+bool hipvs_bulk_build_available(const char *dtype, const char *metric, int64_t extra_info_size,
+                                std::string &unavailable_reason);
 
 // Builds on the GPU and returns a validated stream whose labels are input.ids.
 HipvsBuildStatus build_hnsw_with_hipvs(HipvsPluginRuntime &runtime,

@@ -81,6 +81,30 @@ void test_relabel()
   }
 }
 
+// Builders insert in parallel, so element order need not match input order; the
+// stored label (input row) decides which id the element gets.
+void test_relabel_follows_stored_label()
+{
+  const Layout layout{5, 3, 4};
+  const std::vector<int64_t> labels{3, 0, 4, 1, 2};
+  std::string data = hnswlib_fixture::make_stream(layout, labels);
+  const std::vector<int64_t> ids = make_ids(layout.rows);
+  std::string error;
+  expect(stream::validate_and_relabel(&data[0], data.size(), stream::Expectation{5, 3, 4}, ids.data(), error),
+         "permuted stream is accepted");
+  for (size_t row = 0; row < layout.rows; ++row) {
+    expect(hnswlib_fixture::read_label(data, layout, row) == ids[labels[row]],
+           "element relabeled by its stored input row, not its position");
+  }
+
+  expect(!accepts(hnswlib_fixture::make_stream(layout, {0, 1, 1, 3, 4}), layout, stream::Expectation{5, 3, 4}),
+         "duplicate label rejected");
+  expect(!accepts(hnswlib_fixture::make_stream(layout, {0, 1, 2, 3, 5}), layout, stream::Expectation{5, 3, 4}),
+         "out-of-range label rejected");
+  expect(!accepts(hnswlib_fixture::make_stream(layout, {0, 1, 2, 3, -1}), layout, stream::Expectation{5, 3, 4}),
+         "negative label rejected");
+}
+
 void test_rejections()
 {
   const Layout layout{5, 3, 4};
@@ -147,6 +171,7 @@ int main()
 {
   test_header_size();
   test_relabel();
+  test_relabel_follows_stored_label();
   test_rejections();
   test_seekable_buffer();
   if (failures == 0) {

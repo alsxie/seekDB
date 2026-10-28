@@ -23,6 +23,8 @@
 #include <cstring>
 #include <istream>
 #include <map>
+#include <mutex>
+#include <string>
 #include "vsag/vsag.h"
 #include "vsag/errors.h"
 #include "vsag/dataset.h"
@@ -977,8 +979,22 @@ static bool external_hnsw_build_supported(int index_type, const char *dtype, con
 
 bool prefer_bulk_build(int index_type, const char *dtype, const char *metric, int64_t extra_info_size)
 {
-  return external_hnsw_build_supported(index_type, dtype, metric, extra_info_size) &&
-         hipvs_bulk_build_available(dtype, metric, extra_info_size);
+  if (!external_hnsw_build_supported(index_type, dtype, metric, extra_info_size)) {
+    return false;
+  }
+  std::string unavailable_reason;
+  const bool available =
+      hipvs_bulk_build_available(dtype, metric, extra_info_size, unavailable_reason);
+  if (!unavailable_reason.empty()) {
+    // Plugin loading is attempted once per process, so the reason never changes.
+    static std::once_flag reported;
+    std::call_once(reported, [&unavailable_reason]() {
+      int ret = OB_ERR_VSAG_RETURN_ERROR;  // only carries the reason into LOG_WARN
+      LOG_WARN("[OBVSAG] hipVS enabled but plugin unavailable; HNSW builds stay on CPU",
+               KCSTRING(unavailable_reason.c_str()));
+    });
+  }
+  return available;
 }
 
 // Returns true when the GPU-built graph has been imported into index_handler.

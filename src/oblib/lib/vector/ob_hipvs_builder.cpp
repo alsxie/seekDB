@@ -230,11 +230,12 @@ HipvsPluginRuntime &default_hipvs_runtime()
   return *runtime;
 }
 
-bool hipvs_bulk_build_available(const char *dtype, const char *metric, int64_t extra_info_size)
+bool hipvs_bulk_build_available(const char *dtype, const char *metric, int64_t extra_info_size,
+                                std::string &unavailable_reason)
 {
-  std::string error;
+  unavailable_reason.clear();
   return hipvs_config().enabled && hipvs_supports(dtype, metric, extra_info_size) &&
-         default_hipvs_runtime().available(error);
+         default_hipvs_runtime().available(unavailable_reason);
 }
 
 HipvsBuildStatus build_hnsw_with_hipvs(HipvsPluginRuntime &runtime,

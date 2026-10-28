@@ -49,8 +49,10 @@ inline void put_list(std::string &out, const std::vector<uint32_t> &neighbors, s
 }
 
 // Row 0 is the entry point and the only element on level 1; every row links to its
-// ring neighbors on level 0. Labels are row numbers, as an external builder emits.
-inline std::string make_stream(const Layout &layout)
+// ring neighbors on level 0. Element `row` carries label labels[row] (the input row
+// number, as an external builder emits) and that row's vector; an empty labels
+// vector means element order equals input order.
+inline std::string make_stream(const Layout &layout, const std::vector<int64_t> &labels = {})
 {
   const size_t m = static_cast<size_t>(layout.m);
   const size_t level0_links = (2 * m + 1) * sizeof(uint32_t);
@@ -77,10 +79,11 @@ inline std::string make_stream(const Layout &layout)
       neighbors.push_back(static_cast<uint32_t>((row + layout.rows - 1) % layout.rows));
     }
     put_list(out, neighbors, 2 * m);
+    const int64_t label = labels.empty() ? static_cast<int64_t>(row) : labels[row];
     for (int d = 0; d < layout.dim; ++d) {
-      put(out, static_cast<float>(row * 10 + d));
+      put(out, static_cast<float>(label * 10 + d));
     }
-    put(out, static_cast<int64_t>(row));
+    put(out, label);
   }
   for (size_t row = 0; row < layout.rows; ++row) {
     if (row == 0) {
