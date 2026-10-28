@@ -1,11 +1,48 @@
+load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
 load("@rules_cc//cc:cc_test.bzl", "cc_test")
 load("//bazel:defs.bzl", "cc_library")
 
 package(default_testonly = True)
 
+# GPU-free stand-in for libseekdb_hipvs.so used by test_hipvs_builder.
+cc_binary(
+    name = "libhipvs_mock_plugin.so",
+    srcs = [
+        "hipvs_mock_plugin.cpp",
+        "hnswlib_stream_fixture.h",
+    ],
+    linkshared = True,
+    deps = ["//src/oblib:hipvs_builder_test_support"],
+    target_compatible_with = select({
+        "@platforms//os:linux": [],
+        "@platforms//os:macos": [],
+        "//conditions:default": ["@platforms//:incompatible"],
+    }),
+)
+
 cc_test(
     name = "test_hipvs_builder",
-    srcs = ["test_hipvs_builder.cpp"],
+    srcs = [
+        "hnswlib_stream_fixture.h",
+        "test_hipvs_builder.cpp",
+    ],
+    args = ["$(rootpath :libhipvs_mock_plugin.so)"],
+    data = [":libhipvs_mock_plugin.so"],
+    linkstatic = True,
+    deps = ["//src/oblib:hipvs_builder_test_support"],
+    target_compatible_with = select({
+        "@platforms//os:linux": [],
+        "@platforms//os:macos": [],
+        "//conditions:default": ["@platforms//:incompatible"],
+    }),
+)
+
+cc_test(
+    name = "test_hnswlib_stream",
+    srcs = [
+        "hnswlib_stream_fixture.h",
+        "test_hnswlib_stream.cpp",
+    ],
     linkstatic = True,
     deps = ["//src/oblib:hipvs_builder_test_support"],
 )

@@ -1690,7 +1690,25 @@ int ObPluginVectorIndexAdaptor::add_snap_index(float *vectors, int64_t *vids, Ob
   } else if (OB_FALSE_IT(dim = param->dim_)) {
   } else if (OB_FAIL(get_extra_info_actual_size(extra_info_actual_size))) {
   } else {
-    if (param->type_ == ObVectorIndexAlgorithmType::VIAT_HNSW ||
+    if (need_bulk_snap_build(*param)) {
+      // Collect the whole snapshot; check_snap_hnswsq_index builds it with one build_index call.
+      if (OB_FAIL(init_hnswsq_mem_data())) {
+      } else if (num == 0 || OB_ISNULL(vectors)) {
+        // do nothing
+      } else if (OB_ISNULL(vids)) {
+        ret = OB_ERR_UNEXPECTED;
+      } else {
+        TCWLockGuard lock_guard(snap_data_->mem_data_rwlock_);
+        if (OB_NOT_NULL(snap_data_->index_)) {
+          // already built by a previous finish call, keep writing into it
+          lib::ObMallocHookAttrGuard malloc_guard(lib::ObMemAttr("VIndexVsagADP"));
+          lib::ObLightBacktraceGuard light_backtrace_guard(false);
+          if (OB_FAIL(obvectorutil::add_index(snap_data_->index_, vectors, vids, dim, nullptr, num))) {
+          }
+        } else if (OB_FAIL(append_snap_build_cache(vectors, vids, nullptr, num, 0))) {
+        }
+      }
+    } else if (param->type_ == ObVectorIndexAlgorithmType::VIAT_HNSW ||
         param->type_ == ObVectorIndexAlgorithmType::VIAT_HGRAPH ||
         param->type_ == ObVectorIndexAlgorithmType::VIAT_IPIVF) {
       if (OB_FAIL(try_init_mem_data(VIRT_SNAP))) {
@@ -1745,22 +1763,8 @@ int ObPluginVectorIndexAdaptor::add_snap_index(float *vectors, int64_t *vids, Ob
           } else {
             TCWLockGuard lock_guard(snap_data_->mem_data_rwlock_);
             if (OB_ISNULL(snap_data_->index_)) {
-              // snap_data_->vid_array_ may be released by other thread.
-              if (OB_ISNULL(snap_data_->vid_array_) || OB_ISNULL(snap_data_->vec_array_) || (OB_NOT_NULL(extra_info_buf) && OB_ISNULL(snap_data_->extra_info_buf_))) {
-                ret = OB_ERR_UNEXPECTED;
-              }
               // frist: write into cache
-              for (int i = 0; OB_SUCC(ret) && i < num; i++) {
-                if (OB_FAIL(snap_data_->vid_array_->push_back(vids[i]))) {
-                }
-              }
-              for (int i = 0; OB_SUCC(ret) && i < num * dim; i++) {
-                if (OB_FAIL(snap_data_->vec_array_->push_back(vectors[i]))) {
-                }
-              }
-              if (OB_SUCC(ret) && OB_NOT_NULL(extra_info_buf)) {
-                if (OB_FAIL(snap_data_->extra_info_buf_->append(extra_info_buf, num * param->extra_info_actual_size_))) {
-                }
+              if (OB_FAIL(append_snap_build_cache(vectors, vids, extra_info_buf, num, param->extra_info_actual_size_))) {
               }
               LOG_INFO("HgraphIndex add into cache array success", K(ret), K(dim), K(num), K(vids[0]), K(vids[num - 1]), KPC(snap_data_->vid_array_));
 
@@ -1793,6 +1797,46 @@ int ObPluginVectorIndexAdaptor::add_snap_index(float *vectors, int64_t *vids, Ob
     }
   }
 
+  return ret;
+}
+
+bool ObPluginVectorIndexAdaptor::need_bulk_snap_build(const ObVectorIndexParam &param)
+{
+  return !is_sparse_vector_index_type() &&
+         obvectorutil::prefer_bulk_build(param.type_, "float32",
+                                         VEC_INDEX_ALGTH[param.dist_algorithm_],
+                                         param.extra_info_actual_size_);
+}
+
+// Caller holds snap_data_->mem_data_rwlock_ in write mode.
+int ObPluginVectorIndexAdaptor::append_snap_build_cache(float *vectors, int64_t *vids, char *extra_info_buf,
+                                                        int num, int64_t extra_info_size)
+{
+  INIT_SUCC(ret);
+  ObVectorIndexParam *param = static_cast<ObVectorIndexParam*>(algo_data_);
+  // snap_data_->vid_array_ may be released by other thread.
+  if (OB_ISNULL(param) || OB_ISNULL(snap_data_->vid_array_) || OB_ISNULL(snap_data_->vec_array_) ||
+      (OB_NOT_NULL(extra_info_buf) && OB_ISNULL(snap_data_->extra_info_buf_))) {
+    ret = OB_ERR_UNEXPECTED;
+  } else {
+    const int64_t dim = param->dim_;
+    ObVecIdxVidArray *vid_array = snap_data_->vid_array_;
+    ObVecIdxVecArray *vec_array = snap_data_->vec_array_;
+    // No explicit reserve: ObArray::reserve grows to the exact block-rounded size, which would
+    // reallocate on every single-row call from the DDL pipeline; push_back grows geometrically.
+    for (int64_t i = 0; OB_SUCC(ret) && i < num; i++) {
+      if (OB_FAIL(vid_array->push_back(vids[i]))) {
+      }
+    }
+    for (int64_t i = 0; OB_SUCC(ret) && i < num * dim; i++) {
+      if (OB_FAIL(vec_array->push_back(vectors[i]))) {
+      }
+    }
+    if (OB_SUCC(ret) && OB_NOT_NULL(extra_info_buf)) {
+      if (OB_FAIL(snap_data_->extra_info_buf_->append(extra_info_buf, num * extra_info_size))) {
+      }
+    }
+  }
   return ret;
 }
 
@@ -2011,8 +2055,10 @@ int ObPluginVectorIndexAdaptor::check_snap_hnswsq_index()
     ret = OB_ERR_UNEXPECTED;
   } else if (OB_ISNULL(param = static_cast<ObVectorIndexParam*>(algo_data_))) {
     ret = OB_ERR_UNEXPECTED;
-  } else if (param->type_ == VIAT_HNSW || param->type_ == VIAT_HGRAPH || snap_data_->has_build_sq_ || param->type_ == VIAT_IPIVF) {
-    // do nothing
+  } else if (snap_data_->has_build_sq_ ||
+             ((param->type_ == VIAT_HNSW || param->type_ == VIAT_HGRAPH || param->type_ == VIAT_IPIVF) &&
+              OB_ISNULL(vid_array))) {
+    // nothing cached: the snapshot was written incrementally
   } else if (OB_ISNULL(snap_data_->index_)) {
     TCWLockGuard lock_guard(snap_data_->mem_data_rwlock_);
     if (OB_FAIL(snap_data_->mem_ctx_->init(parent_mem_ctx_, all_vsag_use_mem_))) {
@@ -2037,12 +2083,14 @@ int ObPluginVectorIndexAdaptor::check_snap_hnswsq_index()
                                              param->refine_type_,
                                              param->bq_bits_query_,
                                              param->bq_use_fht_))) {
-      } else if (OB_FAIL(obvectorutil::add_index(snap_data_->index_,
-                                                 vec_array->get_data(),
-                                                 vid_array->get_data(),
-                                                 param->dim_,
-                                                 extra_info_buf->ptr(),
-                                                 vid_array->count()))) {
+      } else if (vid_array->count() == 0) {
+        // empty snapshot, keep the created index
+      } else if (OB_FAIL(obvectorutil::build_index(snap_data_->index_,
+                                                   vec_array->get_data(),
+                                                   vid_array->get_data(),
+                                                   param->dim_,
+                                                   vid_array->count(),
+                                                   extra_info_buf->ptr()))) {
       } else {
         LOG_INFO("HNSW build index success", K(ret), K(param->dim_), K(vid_array->count()));
       }

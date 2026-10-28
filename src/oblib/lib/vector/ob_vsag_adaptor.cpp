@@ -18,11 +18,11 @@
 
 #include "ob_vsag_adaptor.h"
 #include "ob_hipvs_builder.h"
+#include "ob_hnswlib_stream.h"
 #include <chrono>
 #include <cstring>
 #include <istream>
 #include <map>
-#include <streambuf>
 #include "vsag/vsag.h"
 #include "vsag/errors.h"
 #include "vsag/dataset.h"
@@ -41,15 +41,6 @@ namespace obvsag {
 using namespace vsag;
 
 static constexpr int64_t VSAG_SINDI_N_CANDIDATE_FACTOR = 500;
-
-class MemoryInputBuffer final : public std::streambuf {
-public:
-  MemoryInputBuffer(const char *data, size_t size)
-  {
-    char *begin = const_cast<char *>(data);
-    setg(begin, begin, begin + size);
-  }
-};
 
 static int vsag_errcode2ob(vsag::ErrorType vsag_errcode)
 {
@@ -971,6 +962,82 @@ int create_index(VectorIndexPtr &index_handler, IndexType index_type, const char
   return ret;
 }
 
+static int64_t elapsed_us_since(std::chrono::steady_clock::time_point started_at)
+{
+  return std::chrono::duration_cast<std::chrono::microseconds>(
+      std::chrono::steady_clock::now() - started_at).count();
+}
+
+static bool external_hnsw_build_supported(int index_type, const char *dtype, const char *metric,
+                                          int64_t extra_info_size)
+{
+  // Only the plain VSAG "hnsw" index reads the hnswlib layout an external builder emits.
+  return index_type == HNSW_TYPE && hipvs_supports(dtype, metric, extra_info_size);
+}
+
+bool prefer_bulk_build(int index_type, const char *dtype, const char *metric, int64_t extra_info_size)
+{
+  return external_hnsw_build_supported(index_type, dtype, metric, extra_info_size) &&
+         hipvs_bulk_build_available(dtype, metric, extra_info_size);
+}
+
+// Returns true when the GPU-built graph has been imported into index_handler.
+static bool try_import_gpu_hnsw(VectorIndexPtr &index_handler, HnswIndexHandler *hnsw,
+                                float *vector_list, int64_t *ids, int dim, int size)
+{
+  int ret = OB_SUCCESS;  // only carries the fallback reason into LOG_WARN
+  bool imported = false;
+  HipvsBuildInput input;
+  input.vectors = vector_list;
+  input.ids = ids;
+  input.row_count = size;
+  input.dim = dim;
+  input.max_degree = hnsw->get_max_degree();
+  input.ef_construction = hnsw->get_ef_construction();
+  input.metric = hnsw->get_metric();
+
+  HipvsHnswStream stream;
+  HipvsBuildReport report;
+  const HipvsBuildStatus status =
+      build_hnsw_with_hipvs(default_hipvs_runtime(), hipvs_config(), input, stream, report);
+  if (status == HipvsBuildStatus::BUILT) {
+    const auto import_started_at = std::chrono::steady_clock::now();
+    int import_ret = OB_SUCCESS;
+    {
+      hnswlib_stream::MemoryIStreamBuf buffer(stream.data(), stream.size());
+      std::istream input_stream(&buffer);
+      import_ret = fdeserialize(index_handler, input_stream);
+    }
+    const int64_t stream_bytes = static_cast<int64_t>(stream.size());
+    stream.reset();
+    const int64_t import_us = elapsed_us_since(import_started_at);
+    if (import_ret == OB_SUCCESS) {
+      imported = true;
+      LOG_INFO("[OBVSAG] hipVS HNSW stages", K(size), K(dim), K(stream_bytes),
+               "queue_wait_us", report.queue_wait_us,
+               "plugin_us", report.plugin_us,
+               "cagra_build_us", report.plugin_stats.cagra_build_us,
+               "hierarchy_build_us", report.plugin_stats.hierarchy_build_us,
+               "serialize_us", report.plugin_stats.serialize_us,
+               "validate_us", report.validate_us, K(import_us),
+               "device_free_bytes", report.plugin_stats.device_free_bytes,
+               "device_required_bytes", report.plugin_stats.device_required_bytes);
+    } else {
+      ret = import_ret;
+      LOG_WARN("[OBVSAG] VSAG rejected hipVS HNSW stream; falling back to CPU",
+               K(import_ret), K(size), K(dim), K(stream_bytes));
+    }
+  } else if (status == HipvsBuildStatus::FAILED) {
+    ret = OB_ERR_VSAG_RETURN_ERROR;
+    LOG_WARN("[OBVSAG] hipVS HNSW build failed; falling back to CPU",
+             KCSTRING(report.error.c_str()), "plugin_result", report.plugin_result,
+             "device_free_bytes", report.plugin_stats.device_free_bytes,
+             "device_required_bytes", report.plugin_stats.device_required_bytes,
+             K(size), K(dim));
+  }
+  return imported;
+}
+
 int build_index(VectorIndexPtr &index_handler, float *vector_list,
                 int64_t *ids, int dim, int size, char *extra_infos /* = nullptr*/)
 {
@@ -979,37 +1046,19 @@ int build_index(VectorIndexPtr &index_handler, float *vector_list,
     ret = OB_INVALID_ARGUMENT;
   } else {
     HnswIndexHandler *hnsw = static_cast<HnswIndexHandler *>(index_handler);
-    bool built_with_hipvs = false;
-    if (hnsw->get_index_type() == HNSW_TYPE && extra_infos == nullptr &&
-        std::strcmp(hnsw->get_dtype(), "float32") == 0) {
-      std::string serialized_index;
-      std::string hipvs_error;
-      const auto started_at = std::chrono::steady_clock::now();
-      const HipvsBuildStatus status = try_build_hipvs_hnsw(
-          vector_list, ids, size, dim, hnsw->get_max_degree(),
-          hnsw->get_ef_construction(), hnsw->get_metric(), serialized_index,
-          hipvs_error);
-      if (status == HipvsBuildStatus::BUILT) {
-        MemoryInputBuffer input_buffer(serialized_index.data(), serialized_index.size());
-        std::istream input(&input_buffer);
-        const int load_ret = fdeserialize(index_handler, input);
-        if (load_ret == OB_SUCCESS) {
-          built_with_hipvs = true;
-          const auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(
-              std::chrono::steady_clock::now() - started_at).count();
-          LOG_INFO("[OBVSAG] hipVS HNSW build success", K(size), K(dim),
-                   K(elapsed_us));
-        } else {
-          LOG_WARN("[OBVSAG] VSAG rejected hipVS HNSW stream; falling back to CPU",
-                   K(load_ret), K(size), K(dim));
-        }
-      } else if (status == HipvsBuildStatus::FAILED) {
-        LOG_WARN("[OBVSAG] hipVS HNSW build failed; falling back to CPU",
-                 KCSTRING(hipvs_error.c_str()), K(size), K(dim));
-      }
-    }
-
-    if (!built_with_hipvs) {
+    // One clock for both paths so the logged elapsed_us values are comparable.
+    const auto started_at = std::chrono::steady_clock::now();
+    // Extra-info payloads are not part of the hnswlib layout, so either source disqualifies.
+    const int64_t extra_info_size =
+        extra_infos != nullptr ? INT64_MAX : static_cast<int64_t>(hnsw->get_extra_info_size());
+    const bool built_on_gpu =
+        external_hnsw_build_supported(hnsw->get_index_type(), hnsw->get_dtype(), hnsw->get_metric(),
+                                      extra_info_size) &&
+        try_import_gpu_hnsw(index_handler, hnsw, vector_list, ids, dim, size);
+    if (built_on_gpu) {
+      const int64_t elapsed_us = elapsed_us_since(started_at);
+      LOG_INFO("[OBVSAG] HNSW build complete", "path", "hipvs", K(size), K(dim), K(elapsed_us));
+    } else {
       DatasetPtr dataset = vsag::Dataset::Make();
       dataset->Dim(dim)
           ->NumElements(size)
@@ -1019,13 +1068,10 @@ int build_index(VectorIndexPtr &index_handler, float *vector_list,
       if (extra_infos != nullptr) {
         dataset->ExtraInfos(extra_infos);
       }
-      const auto started_at = std::chrono::steady_clock::now();
       if (OB_FAIL(hnsw->build_index(dataset))) {
       } else {
-        const auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(
-            std::chrono::steady_clock::now() - started_at).count();
-        LOG_INFO("[OBVSAG] CPU HNSW build complete", K(size), K(dim),
-                 K(elapsed_us));
+        const int64_t elapsed_us = elapsed_us_since(started_at);
+        LOG_INFO("[OBVSAG] HNSW build complete", "path", "cpu", K(size), K(dim), K(elapsed_us));
       }
     }
   }

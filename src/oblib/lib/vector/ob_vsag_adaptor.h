@@ -120,6 +120,9 @@ int validate_create_index(const CreateIndexParam &param, std::string &err_msg);
 int create_index(VectorIndexPtr &index_handler, IndexType index_type, const char *dtype, const char *metric,
     bool use_reorder, float doc_prune_ratio, int window_size, void *allocator, int extra_info_size = 0);
 int build_index(VectorIndexPtr& index_handler, float* vector_list, int64_t* ids, int dim, int size, char *extra_infos = nullptr);
+// True when the backend builds this index shape faster from the complete dataset in one
+// build_index call (for example on a GPU) than from incremental add_index batches.
+bool prefer_bulk_build(int index_type, const char *dtype, const char *metric, int64_t extra_info_size);
 int build_index(VectorIndexPtr &index_handler, uint32_t *lens, uint32_t *dims, float *vals, int64_t *ids, int size,
     char *extra_info = nullptr);
 int add_index(VectorIndexPtr& index_handler, float* vector, int64_t* ids, int dim, int size, char *extra_info = nullptr);

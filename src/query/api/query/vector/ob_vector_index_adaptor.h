@@ -752,6 +752,9 @@ public:
   int init_hnswsq_mem_data();
   int check_snap_hnswsq_index();
   int build_hnswsq_index(ObVectorIndexParam *param);
+  // Whether snapshot rows are collected and built once instead of added batch by batch.
+  bool need_bulk_snap_build(const ObVectorIndexParam &param);
+  int append_snap_build_cache(float *vectors, int64_t *vids, char *extra_info_buf, int num, int64_t extra_info_size);
   bool is_mem_data_init_atomic(ObVectorIndexRecordType type);
   int try_init_mem_data(ObVectorIndexRecordType type, ObVectorIndexAlgorithmType enforce_type = VIAT_MAX) {
     int ret = OB_SUCCESS;

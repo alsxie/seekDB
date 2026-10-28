@@ -72,6 +72,9 @@ int create_index(obvsag::VectorIndexPtr &index_handler, int index_type, const ch
 
 int build_index(obvsag::VectorIndexPtr index_handler, float* vector_list, int64_t* ids, int dim, int size, char *extra_info = nullptr);
 
+// Whether this index shape should receive the complete dataset in one build_index call.
+bool prefer_bulk_build(int index_type, const char *dtype, const char *metric, int64_t extra_info_size);
+
 int build_index(obvsag::VectorIndexPtr &index_handler, uint32_t *lens, uint32_t *dims, float *vals, int64_t *ids,
     int size, char *extra_infos = nullptr);
 

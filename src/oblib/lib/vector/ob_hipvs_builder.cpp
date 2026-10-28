@@ -14,16 +14,22 @@
  * limitations under the License.
  */
 
+// Author：FDE WorkMate
+
 #include "ob_hipvs_builder.h"
-#include "ob_hipvs_plugin_abi.h"
+#include "ob_hnswlib_stream.h"
 
 #include <cerrno>
+#include <chrono>
 #include <climits>
 #include <cstdlib>
 #include <cstring>
 
-#if defined(__linux__)
+#if (defined(__linux__) || defined(__APPLE__)) && !defined(__EMSCRIPTEN__)
+#define SEEKDB_HIPVS_HAS_DLOPEN 1
 #include <dlfcn.h>
+#else
+#define SEEKDB_HIPVS_HAS_DLOPEN 0
 #endif
 
 namespace oceanbase {
@@ -31,25 +37,31 @@ namespace common {
 namespace obvsag {
 namespace {
 
-bool enabled_by_environment()
+int64_t hipvs_elapsed_us(std::chrono::steady_clock::time_point started_at)
 {
-  const char *value = std::getenv("SEEKDB_HIPVS_ENABLE");
-  return value != nullptr && (std::strcmp(value, "1") == 0 ||
-                              std::strcmp(value, "true") == 0 ||
+  return std::chrono::duration_cast<std::chrono::microseconds>(
+      std::chrono::steady_clock::now() - started_at).count();
+}
+
+bool parse_flag(const char *value)
+{
+  return value != nullptr && (std::strcmp(value, "1") == 0 || std::strcmp(value, "true") == 0 ||
                               std::strcmp(value, "on") == 0);
 }
 
-int64_t minimum_rows()
+bool parse_integer(const char *value, long long minimum, long long maximum, long long &parsed)
 {
-  constexpr int64_t DEFAULT_MINIMUM_ROWS = 10000;
-  const char *value = std::getenv("SEEKDB_HIPVS_MIN_ROWS");
   if (value == nullptr || *value == '\0') {
-    return DEFAULT_MINIMUM_ROWS;
+    return false;
   }
   errno = 0;
   char *end = nullptr;
-  const long long parsed = std::strtoll(value, &end, 10);
-  return errno == 0 && end != value && *end == '\0' && parsed >= 0 ? parsed : DEFAULT_MINIMUM_ROWS;
+  const long long result = std::strtoll(value, &end, 10);
+  if (errno != 0 || end == value || *end != '\0' || result < minimum || result > maximum) {
+    return false;
+  }
+  parsed = result;
+  return true;
 }
 
 bool resolve_metric(const char *metric, int32_t &resolved)
@@ -65,7 +77,12 @@ bool resolve_metric(const char *metric, int32_t &resolved)
   return supported;
 }
 
-#if defined(__linux__)
+const char *process_environment(const char *name)
+{
+  return std::getenv(name);
+}
+
+#if SEEKDB_HIPVS_HAS_DLOPEN
 template <typename Function>
 Function load_function(void *library, const char *name)
 {
@@ -79,85 +96,206 @@ Function load_function(void *library, const char *name)
 
 } // namespace
 
-HipvsBuildStatus try_build_hipvs_hnsw(const float *vectors,
-                                      const int64_t *ids,
-                                      int64_t row_count,
-                                      int dim,
-                                      int max_degree,
-                                      int ef_construction,
-                                      const char *metric,
-                                      std::string &serialized_index,
-                                      std::string &error_message)
+HipvsConfig parse_hipvs_config(HipvsEnvironmentLookup lookup)
 {
-  serialized_index.clear();
-  error_message.clear();
-  if (!enabled_by_environment() || row_count < minimum_rows()) {
-    return HipvsBuildStatus::NOT_REQUESTED;
+  HipvsConfig config;
+  if (lookup == nullptr) {
+    return config;
   }
-  if (vectors == nullptr || ids == nullptr || row_count <= 0 || dim <= 0 ||
-      max_degree <= 0 || ef_construction <= 0 || row_count > INT_MAX) {
-    error_message = "invalid hipVS build request";
-    return HipvsBuildStatus::FAILED;
+  config.enabled = parse_flag(lookup("SEEKDB_HIPVS_ENABLE"));
+  long long parsed = 0;
+  if (parse_integer(lookup("SEEKDB_HIPVS_MIN_ROWS"), 0, LLONG_MAX, parsed)) {
+    config.min_rows = parsed;
   }
+  if (parse_integer(lookup("SEEKDB_HIPVS_MAX_CONCURRENCY"), 1, 64, parsed)) {
+    config.max_concurrency = static_cast<int32_t>(parsed);
+  }
+  const char *library = lookup("SEEKDB_HIPVS_LIBRARY");
+  if (library != nullptr && *library != '\0') {
+    config.library_path = library;
+  }
+  return config;
+}
 
-  int32_t resolved_metric = 0;
-  if (!resolve_metric(metric, resolved_metric)) {
-    error_message = "hipVS supports seekDB l2 and inner-product HNSW indexes only";
-    return HipvsBuildStatus::FAILED;
-  }
+const HipvsConfig &hipvs_config()
+{
+  static const HipvsConfig config = parse_hipvs_config(process_environment);
+  return config;
+}
 
-#if !defined(__linux__)
-  error_message = "hipVS acceleration is available on Linux ROCm hosts only";
-  return HipvsBuildStatus::FAILED;
-#else
-  const char *configured_library = std::getenv("SEEKDB_HIPVS_LIBRARY");
-  const char *library_path = configured_library != nullptr && *configured_library != '\0'
-                                 ? configured_library
-                                 : "libseekdb_hipvs.so";
-  void *library = dlopen(library_path, RTLD_NOW | RTLD_LOCAL);
+bool hipvs_supports(const char *dtype, const char *metric, int64_t extra_info_size)
+{
+  int32_t resolved = 0;
+  return dtype != nullptr && std::strcmp(dtype, "float32") == 0 && extra_info_size == 0 &&
+         resolve_metric(metric, resolved);
+}
+
+void HipvsHnswStream::reset()
+{
+  if (buffer_.data != nullptr && buffer_.release != nullptr) {
+    buffer_.release(buffer_.data);
+  }
+  buffer_ = SeekdbHipvsBuffer{nullptr, 0, nullptr};
+}
+
+void HipvsHnswStream::adopt(const SeekdbHipvsBuffer &buffer)
+{
+  reset();
+  buffer_ = buffer;
+}
+
+HipvsPluginRuntime::HipvsPluginRuntime(const std::string &library_path, int32_t max_concurrency)
+    : library_path_(library_path), max_concurrency_(max_concurrency > 0 ? max_concurrency : 1)
+{
+}
+
+HipvsPluginRuntime::~HipvsPluginRuntime()
+{
+#if SEEKDB_HIPVS_HAS_DLOPEN
+  if (library_ != nullptr) {
+    dlclose(library_);
+  }
+#endif
+}
+
+void HipvsPluginRuntime::load()
+{
+#if SEEKDB_HIPVS_HAS_DLOPEN
+  void *library = dlopen(library_path_.c_str(), RTLD_NOW | RTLD_LOCAL);
   if (library == nullptr) {
     const char *detail = dlerror();
-    error_message = detail == nullptr ? "unable to load hipVS plugin" : detail;
+    load_error_ = detail == nullptr ? "unable to load hipVS plugin" : detail;
+    return;
+  }
+  const auto get_abi_version =
+      load_function<SeekdbHipvsGetAbiVersionFn>(library, "seekdb_hipvs_get_abi_version");
+  const auto build = load_function<SeekdbHipvsBuildHnswFn>(library, "seekdb_hipvs_build_hnsw");
+  if (get_abi_version == nullptr || build == nullptr ||
+      get_abi_version() != SEEKDB_HIPVS_PLUGIN_ABI_VERSION) {
+    load_error_ = "hipVS plugin ABI mismatch";
+    dlclose(library);
+    return;
+  }
+  library_ = library;
+  build_fn_ = build;
+#else
+  load_error_ = "hipVS plugins are not supported on this platform";
+#endif
+}
+
+bool HipvsPluginRuntime::available(std::string &error)
+{
+  std::call_once(load_once_, [this]() { load(); });
+  if (build_fn_ == nullptr) {
+    error = load_error_;
+    return false;
+  }
+  return true;
+}
+
+int HipvsPluginRuntime::build(const SeekdbHipvsBuildRequest &request,
+                              SeekdbHipvsBuffer &output,
+                              SeekdbHipvsBuildStats &stats,
+                              int64_t &queue_wait_us,
+                              std::string &error)
+{
+  if (!available(error)) {
+    return SEEKDB_HIPVS_BUILD_ERROR;
+  }
+  const auto queued_at = std::chrono::steady_clock::now();
+  {
+    std::unique_lock<std::mutex> lock(slot_mutex_);
+    slot_released_.wait(lock, [this]() { return active_builds_ < max_concurrency_; });
+    ++active_builds_;
+  }
+  queue_wait_us = hipvs_elapsed_us(queued_at);
+
+  char error_buffer[512] = {0};
+  const int result = build_fn_(&request, &output, &stats, error_buffer, sizeof(error_buffer));
+  {
+    std::lock_guard<std::mutex> lock(slot_mutex_);
+    --active_builds_;
+  }
+  slot_released_.notify_one();
+  if (result != SEEKDB_HIPVS_OK) {
+    error = error_buffer[0] == '\0' ? "hipVS plugin build failed" : error_buffer;
+  }
+  return result;
+}
+
+HipvsPluginRuntime &default_hipvs_runtime()
+{
+  static HipvsPluginRuntime *runtime =
+      new HipvsPluginRuntime(hipvs_config().library_path, hipvs_config().max_concurrency);
+  return *runtime;
+}
+
+bool hipvs_bulk_build_available(const char *dtype, const char *metric, int64_t extra_info_size)
+{
+  std::string error;
+  return hipvs_config().enabled && hipvs_supports(dtype, metric, extra_info_size) &&
+         default_hipvs_runtime().available(error);
+}
+
+HipvsBuildStatus build_hnsw_with_hipvs(HipvsPluginRuntime &runtime,
+                                       const HipvsConfig &config,
+                                       const HipvsBuildInput &input,
+                                       HipvsHnswStream &stream,
+                                       HipvsBuildReport &report)
+{
+  stream.reset();
+  report = HipvsBuildReport();
+  if (!config.enabled || input.row_count < config.min_rows) {
+    return HipvsBuildStatus::NOT_REQUESTED;
+  }
+  if (input.vectors == nullptr || input.ids == nullptr || input.row_count <= 0 || input.dim <= 0 ||
+      input.max_degree <= 0 || input.ef_construction <= 0 || input.row_count > INT_MAX) {
+    report.error = "invalid hipVS build request";
     return HipvsBuildStatus::FAILED;
   }
-
-  const auto get_abi_version = load_function<SeekdbHipvsGetAbiVersionFn>(library, "seekdb_hipvs_get_abi_version");
-  const auto build_hnsw = load_function<SeekdbHipvsBuildHnswFn>(library, "seekdb_hipvs_build_hnsw");
-  if (get_abi_version == nullptr || build_hnsw == nullptr ||
-      get_abi_version() != SEEKDB_HIPVS_PLUGIN_ABI_VERSION) {
-    error_message = "hipVS plugin ABI mismatch";
-    dlclose(library);
+  int32_t metric = 0;
+  if (!resolve_metric(input.metric, metric)) {
+    report.error = "hipVS supports l2 and inner-product HNSW indexes only";
     return HipvsBuildStatus::FAILED;
   }
 
   SeekdbHipvsBuildRequest request{};
   request.abi_version = SEEKDB_HIPVS_PLUGIN_ABI_VERSION;
-  request.vectors = vectors;
-  request.ids = ids;
-  request.row_count = row_count;
-  request.dim = dim;
-  request.max_degree = max_degree;
-  request.ef_construction = ef_construction;
-  request.metric = resolved_metric;
+  request.struct_size = sizeof(request);
+  request.vectors = input.vectors;
+  request.row_count = input.row_count;
+  request.dim = input.dim;
+  request.max_degree = input.max_degree;
+  request.ef_construction = input.ef_construction;
+  request.metric = metric;
   request.num_threads = 0;
+  report.plugin_stats.struct_size = sizeof(report.plugin_stats);
 
-  SeekdbHipvsBuffer output{};
-  char error_buffer[512] = {0};
-  const int plugin_result = build_hnsw(&request, &output, error_buffer, sizeof(error_buffer));
-  if (plugin_result == 0 && output.data != nullptr && output.size > 0 && output.release != nullptr) {
-    serialized_index.assign(static_cast<const char *>(output.data), output.size);
-    output.release(output.data);
-    dlclose(library);
-    return HipvsBuildStatus::BUILT;
+  SeekdbHipvsBuffer output{nullptr, 0, nullptr};
+  const auto plugin_started_at = std::chrono::steady_clock::now();
+  report.plugin_result = runtime.build(request, output, report.plugin_stats, report.queue_wait_us, report.error);
+  report.plugin_us = hipvs_elapsed_us(plugin_started_at) - report.queue_wait_us;
+  stream.adopt(output);
+  if (report.plugin_result != SEEKDB_HIPVS_OK) {
+    stream.reset();
+    return HipvsBuildStatus::FAILED;
+  }
+  if (stream.data() == nullptr || stream.size() == 0 || output.release == nullptr) {
+    stream.reset();
+    report.error = "hipVS plugin returned an empty stream";
+    return HipvsBuildStatus::FAILED;
   }
 
-  if (output.data != nullptr && output.release != nullptr) {
-    output.release(output.data);
+  const auto validate_started_at = std::chrono::steady_clock::now();
+  const hnswlib_stream::Expectation expected{input.row_count, input.dim, input.max_degree};
+  const bool valid = hnswlib_stream::validate_and_relabel(stream.data(), stream.size(), expected,
+                                                          input.ids, report.error);
+  report.validate_us = hipvs_elapsed_us(validate_started_at);
+  if (!valid) {
+    stream.reset();
+    return HipvsBuildStatus::FAILED;
   }
-  error_message = error_buffer[0] == '\0' ? "hipVS plugin build failed" : error_buffer;
-  dlclose(library);
-  return HipvsBuildStatus::FAILED;
-#endif
+  return HipvsBuildStatus::BUILT;
 }
 
 } // namespace obvsag

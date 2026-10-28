@@ -682,6 +682,7 @@ cc_library(
     hdrs = [
         "lib/vector/ob_hipvs_builder.h",
         "lib/vector/ob_hipvs_plugin_abi.h",
+        "lib/vector/ob_hnswlib_stream.h",
         "lib/vector/ob_vector_util.h",
         "lib/vector/ob_vsag_adaptor.h",
     ],
@@ -702,10 +703,11 @@ cc_library(
     hdrs = [
         "lib/vector/ob_hipvs_builder.h",
         "lib/vector/ob_hipvs_plugin_abi.h",
+        "lib/vector/ob_hnswlib_stream.h",
     ],
     includes = ["."],
     linkopts = select({
-        "@platforms//os:linux": ["-ldl"],
+        "@platforms//os:linux": ["-ldl", "-lpthread"],
         "//conditions:default": [],
     }),
     visibility = ["//unittest/oblib:__pkg__"],
