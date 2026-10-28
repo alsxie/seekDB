@@ -3032,6 +3032,8 @@ public:
   inline bool is_fulltext_column() const { return share::schema::ObSchemaUtils::is_fulltext_column(column_flags_); }
   inline bool is_doc_id_column() const { return share::schema::ObSchemaUtils::is_doc_id_column(column_flags_); }
   inline bool is_vec_hnsw_vid_column() const { return share::schema::ObSchemaUtils::is_vec_hnsw_vid_column(column_flags_); }
+  inline bool is_ai_result_column() const { return column_flags_ & AI_RESULT_COLUMN_FLAG; }
+  inline bool is_ai_hidden_column() const { return column_flags_ & AI_HIDDEN_COLUMN_FLAG; }
   inline bool is_vec_hnsw_vector_column() const { return share::schema::ObSchemaUtils::is_vec_hnsw_vector_column(column_flags_); }
   inline bool is_vec_hnsw_type_column() const { return share::schema::ObSchemaUtils::is_vec_hnsw_type_column(column_flags_); }
   inline bool is_vec_hnsw_scn_column() const { return share::schema::ObSchemaUtils::is_vec_hnsw_scn_column(column_flags_); }

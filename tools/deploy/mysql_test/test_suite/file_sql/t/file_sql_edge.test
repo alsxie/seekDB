@@ -1,0 +1,121 @@
+# owner: database-competition
+# owner group: SQL
+# description: Edge cases of file tables: options, errors, joins, rescan, views and COPY round trips.
+# tags: sql,executor,file_sql
+# 作者：FDE WorkMate
+
+--source mysql_test/test_suite/file_sql/include/copy_file_sql_data.inc
+
+--disable_query_log
+let $FILE_SQL_DATA_DIR = $OBSERVER_DIR/data_for_mysqltest_file_sql;
+set session enable_file_sql = ON;
+
+--echo # unknown table functions and options are rejected
+--disable_result_log
+--error 1064
+eval select * from read_xml('$FILE_SQL_DATA_DIR/basic.csv');
+--enable_result_log
+--disable_result_log
+--error 1235
+eval select * from read_csv('$FILE_SQL_DATA_DIR/basic.csv', no_such_option = 1);
+--enable_result_log
+--disable_result_log
+--error 1235
+eval select * from read_csv('$FILE_SQL_DATA_DIR/basic.csv', header = true, header = false);
+--enable_result_log
+--disable_result_log
+--error 1017
+eval select * from read_csv('$FILE_SQL_DATA_DIR/missing.csv');
+--enable_result_log
+--disable_result_log
+--error 1235
+eval select * from read_csv('$FILE_SQL_DATA_DIR');
+--enable_result_log
+
+--echo # malformed data fails cleanly
+--disable_result_log
+--error 4070
+eval select * from read_json('$FILE_SQL_DATA_DIR/invalid.txt');
+--enable_result_log
+--disable_result_log
+--error 4070
+eval select * from read_parquet('$FILE_SQL_DATA_DIR/basic.csv');
+--enable_result_log
+
+--echo # header = false exposes the header line as data
+eval select column0, column1 from read_csv('$FILE_SQL_DATA_DIR/basic.csv', header = false) f
+      order by column0 limit 2;
+
+--echo # projection, filters, ordering and expressions
+eval select name, score * 2 AS s2 from read_csv('$FILE_SQL_DATA_DIR/basic.csv') f
+      where active = 1 and score > 90 order by name;
+eval describe select id, score * 2 AS s2, upper(name) AS n from read_csv('$FILE_SQL_DATA_DIR/basic.csv') f;
+
+--echo # joins between file tables and with ordinary tables (rescan of the inner side)
+create table file_sql_edge_t (id bigint primary key, tag varchar(10));
+insert into file_sql_edge_t values (1, 'one'), (3, 'three'), (4, 'four');
+eval select c.id, c.name, j.note
+       from read_csv('$FILE_SQL_DATA_DIR/basic.csv') c
+       join read_json('$FILE_SQL_DATA_DIR/basic.jsonl') j on c.id = j.id
+      order by c.id;
+eval select /*+ leading(t c) use_nl(c) */ t.id, t.tag, c.name
+       from file_sql_edge_t t
+       left join read_csv('$FILE_SQL_DATA_DIR/basic.csv') c on t.id = c.id
+      order by t.id;
+eval select t.id, (select count(*) from read_csv('$FILE_SQL_DATA_DIR/basic.csv') c where c.id <= t.id) AS cnt
+       from file_sql_edge_t t order by t.id;
+
+--echo # INSERT ... SELECT and views over file tables
+eval insert into file_sql_edge_t select id + 10, name from read_csv('$FILE_SQL_DATA_DIR/basic.csv');
+select * from file_sql_edge_t order by id;
+eval create view file_sql_edge_v as
+       select id, name from read_csv('$FILE_SQL_DATA_DIR/basic.csv', delim = ',', sample_size = -1) f;
+select * from file_sql_edge_v order by id;
+drop view file_sql_edge_v;
+
+--echo # COPY round trip of quotes, delimiters, newlines, empty strings and NULL
+eval copy (select 1 AS id, 'a,b' AS s union all select 2, 'say "hi"' union all
+           select 3, concat('x', char(10), 'y') union all select 4, '' union all select 5, NULL)
+       to '$FILE_SQL_DATA_DIR/edge1.csv' (format csv, header, nullstr '\\N');
+eval select id, replace(s, char(10), '<NL>') AS s, s is null AS is_null, length(s) AS len
+       from read_csv('$FILE_SQL_DATA_DIR/edge1.csv', nullstr = '\\N') f order by id;
+
+--echo # COPY with custom delimiter and quote, read back with the same options
+eval copy file_sql_edge_t to '$FILE_SQL_DATA_DIR/edge2.csv' (header, delimiter '|', quote '''');
+eval select * from read_csv('$FILE_SQL_DATA_DIR/edge2.csv', delim = '|', quote = '''') f order by id;
+
+--echo # COPY never overwrites and rejects unsupported formats
+--disable_result_log
+--error 1086
+eval copy file_sql_edge_t to '$FILE_SQL_DATA_DIR/edge2.csv';
+--enable_result_log
+--disable_result_log
+--error 1235
+eval copy file_sql_edge_t to '$FILE_SQL_DATA_DIR/edge3.parquet' (format parquet);
+--enable_result_log
+--disable_result_log
+--error 1017
+eval copy file_sql_edge_t to '$FILE_SQL_DATA_DIR/no_such_dir/edge4.csv';
+--enable_result_log
+
+--echo # a failed COPY leaves no file behind
+--disable_result_log
+--error 4070
+eval copy (select * from read_json('$FILE_SQL_DATA_DIR/invalid.txt')) to '$FILE_SQL_DATA_DIR/edge5.csv';
+--enable_result_log
+eval select substring_index(file, '/', -1) AS file from glob('$FILE_SQL_DATA_DIR/edge*') order by file;
+
+--echo # disabling the switch blocks every entry point
+set session enable_file_sql = OFF;
+--disable_result_log
+--error 1235
+eval select * from glob('$FILE_SQL_DATA_DIR/*');
+--enable_result_log
+--disable_result_log
+--error 1235
+eval copy file_sql_edge_t to '$FILE_SQL_DATA_DIR/edge6.csv';
+--enable_result_log
+drop table file_sql_edge_t;
+--enable_query_log
+
+--source mysql_test/test_suite/file_sql/include/remove_file_sql_data.inc

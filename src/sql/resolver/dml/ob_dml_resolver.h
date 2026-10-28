@@ -27,6 +27,11 @@ namespace oceanbase
 {
 namespace sql
 {
+namespace file_sql
+{
+struct FileOption;
+struct FileColumnDesc;
+}
 class ObEqualAnalysis;
 class ObChildStmtResolver;
 class ObDelUpdStmt;
@@ -208,6 +213,12 @@ public:
   int resolve_json_table_item(const ParseNode &table_node,
                               TableItem *&table_item);
   int resolve_unnest_item(const ParseNode &table_node, TableItem *&table_item);
+  int resolve_file_table_item(const ParseNode &table_node, TableItem *&table_item);
+  int file_table_add_column(TableItem &table_item, const file_sql::FileColumnDesc &file_col,
+                            const int64_t col_idx);
+  // Collects `name [=] value` options of a file table function or COPY statement.
+  static int resolve_file_sql_options(const ParseNode *option_list,
+                                      common::ObIArray<file_sql::FileOption> &options);
   int create_unnest_table_item(TableItem *&table_item, ObString table_name);
   int unnest_table_add_column(TableItem *&table_item, ColumnItem *&col_item, ObString col_name);
   int resolve_hybrid_search_item(const ParseNode &parse_tree, TableItem *&table_item);
@@ -487,6 +498,7 @@ protected:
   int generate_ddl_sample_info_if_needed(TableItem &table_item);
 
 protected:
+  int check_ai_column_strict_read(const TableItem &table_item, const ColumnItem &col_item);
   int check_basic_column_generated(const ObColumnRefRawExpr *col_expr,
                                   ObDMLStmt *dml_stmt,
                                   bool &is_generated);

@@ -2286,6 +2286,16 @@ int ObDDLResolver::resolve_normal_column_attribute(ObColumnSchemaV2 &column,
       {
         break;
       }
+      case T_AI_COLUMN_DEFINITION: {
+        // resolved by AiColumnResolver once the column itself is known; only CREATE TABLE and
+        // ADD COLUMN may define an AI column
+        if (stmt::T_ALTER_TABLE == stmt_->get_stmt_type()
+            && OB_DDL_ADD_COLUMN != static_cast<AlterColumnSchema &>(column).alter_type_) {
+          ret = OB_NOT_SUPPORTED;
+          LOG_USER_ERROR(OB_NOT_SUPPORTED, "changing a column into an AI COLUMN");
+        }
+        break;
+      }
       default:  // won't be here
         ret = OB_ERR_PARSER_SYNTAX;
         SQL_RESV_LOG(WARN, "Wrong column attribute", K(ret), K(attr_node->type_));

@@ -67,6 +67,16 @@ public:
   int resolve_convert_to_character(const ParseNode &node);
   int resolve_foreign_key_options(const ParseNode &node);
   int resolve_add_column(const ParseNode &node, ObColumnNameSet &resolve_add_column);
+  // Keeps AI columns consistent under DROP / CHANGE / MODIFY / RENAME COLUMN: a dropped AI column
+  // takes its hidden columns along, AI columns themselves cannot be redefined, and columns an AI
+  // column reads cannot be dropped or renamed.
+  int check_ai_column_alters(ObAlterTableStmt &stmt);
+  // RETRY AI COLUMN col [WHERE cond]
+  int resolve_ai_column_retry(const ParseNode &node);
+  // UPDATE that gives the matching rows of AI column %column_name a new PENDING request
+  int gen_ai_column_restart_sql(const common::ObString &column_name,
+                                const common::ObString &where_text,
+                                common::ObString &sql);
   int resolve_alter_column(const ParseNode &node);
   int resolve_change_column(const ParseNode &node);
   int check_modify_column_allowed(const share::schema::AlterColumnSchema &alter_column_schema,

@@ -72,6 +72,20 @@ protected:
 
   int resolve_additional_assignments(common::ObIArray<ObTableAssignment> &table_assigns,
                                      const ObStmtScope scope);
+  // AI COLUMN: when a dependency or a rowkey column of a table with AI columns is assigned, the
+  // affected AI columns are invalidated in the same statement (result NULL, state PENDING and a
+  // new request id that the DML operator turns into a task).
+  int add_ai_column_assignments(common::ObIArray<ObTableAssignment> &table_assigns);
+  int add_ai_column_assignment(common::ObIArray<ObTableAssignment> &table_assigns,
+                               const TableItem &table_item,
+                               const share::schema::ObTableSchema &table_schema,
+                               const uint64_t column_id,
+                               ObRawExpr *value);
+  // Shared per statement so that all AI columns of one row get the same request id.
+  int get_ai_request_expr(ObRawExpr *&expr);
+  // Default value of an AI hidden column for INSERT, NULL when %col_schema is not one.
+  int build_ai_column_insert_expr(const share::schema::ObColumnSchemaV2 &col_schema,
+                                  ObRawExpr *&expr);
   int generate_wrapper_expr_for_assignemnts(common::ObIArray<ObAssignment> &assigns,
                                             bool has_before_trigger);
 
@@ -240,6 +254,7 @@ private:
   bool is_column_specify_;
 protected:
   bool is_resolve_insert_update_;
+  ObRawExpr *ai_request_expr_;
 };
 
 } /* namespace sql */

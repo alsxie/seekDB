@@ -37,6 +37,7 @@ public:
   virtual int cg_expr(ObExprCGCtx &expr_cg_ctx, const ObRawExpr &raw_expr,
                   ObExpr &rt_expr) const override;
 private:
+  static int set_text_calc_type(ObExprResType &type);
   DISALLOW_COPY_AND_ASSIGN(ObExprAIPrompt);
 };
 

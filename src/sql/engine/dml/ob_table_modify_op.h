@@ -37,6 +37,7 @@ enum ObDmlSnapshotOptState
   
 class ForeignKeyHandle
 {
+  friend class AiColumnTaskHandle;
 public:
   struct ObFkRowResInfo
   {
@@ -96,6 +97,20 @@ private:
   
   static int is_self_ref_row(ObEvalCtx &ctx, const ObExprPtrIArray &row,
                              const ObForeignKeyArg &fk_arg, bool &is_self_ref);
+};
+
+// Keeps __all_ai_column_task in step with the rows of a table with AI columns: a row whose AI
+// column got a new request id while PENDING owns a task, the task of the replaced request id is
+// removed.  Runs as nested SQL inside the DML transaction, so a rollback leaves nothing behind.
+// 作者：FDE WorkMate
+class AiColumnTaskHandle
+{
+public:
+  static int do_handle(ObTableModifyOp &op,
+                       const ObDMLBaseCtDef &dml_ctdef);
+private:
+  static int get_int(ObTableModifyOp &op, const ObExprPtrIArray &row, const int32_t idx,
+                     int64_t &value);
 };
 
 class ObTableModifyOp;
@@ -238,7 +253,8 @@ public:
   bool has_before_row_trigger(const ObDMLBaseCtDef &dml_ctdef) { return dml_ctdef.is_primary_index_ && dml_ctdef.trig_ctdef_.all_tm_points_.has_before_row(); }
   bool has_after_row_trigger(const ObDMLBaseCtDef &dml_ctdef) { return dml_ctdef.is_primary_index_ && dml_ctdef.trig_ctdef_.all_tm_points_.has_after_row(); }
   bool need_foreign_key_check(const ObDMLBaseCtDef &dml_ctdef) { return dml_ctdef.is_primary_index_ && dml_ctdef.fk_args_.count() > 0; }
-  bool need_after_row_process(const ObDMLBaseCtDef &dml_ctdef) { return need_foreign_key_check(dml_ctdef) || has_after_row_trigger(dml_ctdef); }
+  bool need_ai_column_task(const ObDMLBaseCtDef &dml_ctdef) { return dml_ctdef.is_primary_index_ && dml_ctdef.ai_task_args_.count() > 0; }
+  bool need_after_row_process(const ObDMLBaseCtDef &dml_ctdef) { return need_foreign_key_check(dml_ctdef) || has_after_row_trigger(dml_ctdef) || need_ai_column_task(dml_ctdef); }
   void set_execute_single_row() { execute_single_row_ = true; }
   void unset_execute_single_row() { execute_single_row_ = false; }
   bool get_execute_single_row() const { return execute_single_row_; }

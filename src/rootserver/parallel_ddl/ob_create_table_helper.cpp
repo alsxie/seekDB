@@ -17,6 +17,7 @@
 #define USING_LOG_PREFIX RS
 #include "rootserver/parallel_ddl/ob_create_table_helper.h"
 #include "rootserver/ob_index_builder.h"
+#include "rootserver/ob_ddl_operator.h"
 #include "rootserver/ob_lob_meta_builder.h"
 #include "rootserver/ob_lob_piece_builder.h"
 #include "rootserver/ob_table_creator.h"
@@ -878,6 +879,12 @@ int ObCreateTableHelper::clean_on_fail_commit_()
 int ObCreateTableHelper::operation_before_commit_() {
   int ret = OB_SUCCESS;
   if (OB_FAIL(check_inner_stat_())) {
+  } else if (arg_.ai_column_defs_.count() <= 0) {
+  } else if (OB_UNLIKELY(new_tables_.count() <= 0)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (OB_FAIL(ObDDLOperator::write_ai_column_meta(get_trans_(), new_tables_.at(0),
+                                                         arg_.ai_column_defs_))) {
+    LOG_WARN("fail to write ai column meta", KR(ret));
   }
   return ret;
 }

@@ -94,6 +94,7 @@
 #include "sql/resolver/cmd/ob_get_diagnostics_resolver.h"
 #include "sql/resolver/dcl/ob_alter_role_resolver.h"
 #include "sql/pl/ob_pl_package.h"
+#include "sql/resolver/dml/file_describe_resolver.h"
 
 namespace oceanbase
 {
@@ -402,6 +403,7 @@ int ObResolver::resolve(IsPrepared if_prepared, const ParseNode &parse_tree, ObS
       case T_SHOW_DATABASES:
       case T_SHOW_VARIABLES:
       case T_SHOW_COLUMNS:
+      case T_SHOW_AI_COLUMNS:
       case T_SHOW_SCHEMA:
       case T_SHOW_CREATE_DATABASE:
       case T_SHOW_CREATE_TABLE:
@@ -473,7 +475,11 @@ int ObResolver::resolve(IsPrepared if_prepared, const ParseNode &parse_tree, ObS
         break;
       }
       case T_EXPLAIN: {
-        REGISTER_STMT_RESOLVER(Explain);
+        if (FileDescribeResolver::is_file_describe(*real_parse_tree)) {
+          ret = stmt_resolver_func<FileDescribeResolver>(params_, *real_parse_tree, stmt);
+        } else {
+          REGISTER_STMT_RESOLVER(Explain);
+        }
         break;
       }
       case T_ALTER_SYSTEM_SET: {

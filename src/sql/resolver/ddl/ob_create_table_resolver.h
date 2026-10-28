@@ -84,6 +84,10 @@ private:
                              const int resolve_rule);
   int resolve_insert_mode(const ParseNode *parse_tree);
   int resolve_table_elements_from_select(const ParseNode &parse_tree);
+  // Resolves the AI COLUMN definitions of the element list: validates them, adds their hidden
+  // columns and records their metadata into the create table arg.
+  int resolve_ai_columns(const ParseNode &node, const int resolve_rule,
+                         share::schema::ObTableSchema &table_schema);
   int set_temp_table_info(share::schema::ObTableSchema &table_schema, ParseNode *commit_option_node);
 
   int resolve_table_charset_info(const ParseNode *node);

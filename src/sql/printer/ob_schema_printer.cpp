@@ -16,6 +16,8 @@
 
 #define USING_LOG_PREFIX SHARE_SCHEMA
 #include "sql/printer/ob_schema_printer.h"
+#include "share/ai_service/ob_ai_service_struct.h"
+#include "share/ob_server_struct.h"
 #include "share/ob_autoincrement_service.h"
 #include "sql/resolver/expr/ob_raw_expr_util.h"
 
@@ -204,6 +206,10 @@ int ObSchemaPrinter::print_table_definition_columns(const ObTableSchema &table_s
             }
           }
         }
+        if (OB_SUCC(ret) && col->is_ai_result_column()) {
+          if (OB_FAIL(print_ai_column_definition(*col, buf, buf_len, pos))) {
+          }
+        }
         if (OB_SUCC(ret) && col->is_invisible_column()) {
           if (OB_FAIL(databuff_printf(buf, buf_len, pos, " INVISIBLE"))) {
           }
@@ -329,6 +335,31 @@ int ObSchemaPrinter::print_table_definition_columns(const ObTableSchema &table_s
   if (ret != OB_ITER_END) {
   } else {
     ret = OB_SUCCESS;
+  }
+  return ret;
+}
+
+// AI COLUMN (<expr>) WITH (...) as written by the user. 作者：FDE WorkMate
+int ObSchemaPrinter::print_ai_column_definition(const ObColumnSchemaV2 &col,
+                                                char *buf,
+                                                int64_t buf_len,
+                                                int64_t &pos) const
+{
+  int ret = OB_SUCCESS;
+  ObArenaAllocator allocator("SchemaPrinter");
+  ObString original_expr;
+  ObString sync_mode;
+  int64_t max_retries = 0;
+  if (OB_ISNULL(GCTX.sql_proxy_)) {
+    ret = OB_NOT_INIT;
+  } else if (OB_FAIL(share::AiColumnUtil::load_column_definition(
+                 *GCTX.sql_proxy_, allocator, col.get_table_id(), col.get_column_id(),
+                 original_expr, sync_mode, max_retries))) {
+    LOG_WARN("fail to load ai column definition", K(ret), K(col.get_column_name_str()));
+  } else if (OB_FAIL(databuff_printf(buf, buf_len, pos,
+                                     " AI COLUMN (%.*s) WITH (sync_mode='%.*s', max_retries=%ld)",
+                                     original_expr.length(), original_expr.ptr(),
+                                     sync_mode.length(), sync_mode.ptr(), max_retries))) {
   }
   return ret;
 }

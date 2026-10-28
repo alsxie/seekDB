@@ -537,6 +537,14 @@ public:
                                    const bool is_grant,
                                    const common::ObString *ddl_stmt_str,
                                    share::schema::ObSchemaGetterGuard &schema_guard);
+  // Persists AI column metadata of `table` into __all_ai_column inside the DDL transaction.
+  static int write_ai_column_meta(common::ObISQLClient &trans,
+                                  const share::schema::ObTableSchema &table,
+                                  const common::ObIArray<share::AiColumnDef> &defs);
+  // Removes metadata and tasks of AI columns that `table` no longer has, inside the DDL
+  // transaction, so DML never sees a definition of a dropped AI column.
+  static int prune_ai_column_meta(common::ObISQLClient &trans,
+                                  const share::schema::ObTableSchema &table);
   static int drop_obj_privs(const uint64_t obj_id,
                             const uint64_t obj_ypte,
                             common::ObMySQLTransaction &trans,

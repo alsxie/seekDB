@@ -21,6 +21,7 @@
 #include "query/session/ob_inner_sql_connection_access.h"
 #include "sql/engine/ob_physical_plan.h"
 #include "sql/engine/dml/ob_dml_service.h"
+#include "share/ai_service/ob_ai_service_struct.h"
 
 namespace oceanbase
 {
@@ -116,6 +117,115 @@ int ForeignKeyHandle::do_handle(ObTableModifyOp &op,
     op.get_exec_ctx().get_das_ctx().is_fk_cascading_ = false;
     op.get_exec_ctx().get_das_ctx().in_ignore_cascading_ = save_in_ignore_cascading;
   } else {
+  }
+  return ret;
+}
+
+// ---------------------------------------------------------------------------
+// AI column task maintenance. 作者：FDE WorkMate
+// ---------------------------------------------------------------------------
+int AiColumnTaskHandle::get_int(ObTableModifyOp &op, const ObExprPtrIArray &row,
+                                const int32_t idx, int64_t &value)
+{
+  int ret = OB_SUCCESS;
+  ObDatum *datum = NULL;
+  value = 0;
+  if (OB_UNLIKELY(idx < 0 || idx >= row.count()) || OB_ISNULL(row.at(idx))) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("invalid ai column index", K(ret), K(idx), K(row.count()));
+  } else if (OB_FAIL(row.at(idx)->eval(op.get_eval_ctx(), datum))) {
+  } else if (OB_ISNULL(datum)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (!datum->is_null()) {
+    value = datum->get_int();
+  }
+  return ret;
+}
+
+int AiColumnTaskHandle::do_handle(ObTableModifyOp &op, const ObDMLBaseCtDef &dml_ctdef)
+{
+  int ret = OB_SUCCESS;
+  const ObExprPtrIArray &old_row = dml_ctdef.old_row_;
+  const ObExprPtrIArray &new_row = dml_ctdef.new_row_;
+  ObArenaAllocator alloc(ObModIds::OB_SQL_EXPR);
+  ObSqlString delete_sql;
+  ObSqlString insert_sql;
+  char *where_buf = NULL;
+  int64_t where_len = 0;
+  int64_t where_pos = 0;
+  ObSqlString rowkey_hex;
+  for (int64_t i = 0; OB_SUCC(ret) && i < dml_ctdef.ai_task_args_.count(); ++i) {
+    const ObAiColumnTaskArg &arg = dml_ctdef.ai_task_args_.at(i);
+    int64_t old_state = 0;
+    int64_t old_request = 0;
+    int64_t new_state = 0;
+    int64_t new_request = 0;
+    if (!old_row.empty()
+        && (OB_FAIL(get_int(op, old_row, arg.state_idx_, old_state))
+            || OB_FAIL(get_int(op, old_row, arg.request_idx_, old_request)))) {
+    } else if (!new_row.empty()
+               && (OB_FAIL(get_int(op, new_row, arg.state_idx_, new_state))
+                   || OB_FAIL(get_int(op, new_row, arg.request_idx_, new_request)))) {
+    } else {
+      const bool request_replaced = old_row.empty() || new_row.empty() || old_request != new_request;
+      if (request_replaced && !old_row.empty() && AI_ROW_STATE_PENDING == old_state) {
+        if (OB_FAIL(delete_sql.append_fmt("%s(table_id = %lu AND request_id = %ld AND column_id = %lu)",
+                                          delete_sql.empty() ? "" : " OR ",
+                                          arg.table_id_, old_request, arg.column_id_))) {
+        }
+      }
+      if (OB_SUCC(ret) && request_replaced && !new_row.empty()
+          && AI_ROW_STATE_PENDING == new_state) {
+        if (NULL == where_buf) {
+          if (OB_FAIL(ForeignKeyHandle::gen_where(op.get_eval_ctx(), where_buf, where_len, where_pos,
+                                                  dml_ctdef.ai_rowkey_columns_, new_row, alloc,
+                                                  op.get_obj_print_params()))) {
+            LOG_WARN("fail to print ai column rowkey", K(ret));
+          } else if (OB_FAIL(sql_append_hex_escape_str(ObString(where_pos - 1, where_buf),
+                                                       rowkey_hex))) {
+          }
+        }
+        if (OB_FAIL(ret)) {
+        } else if (OB_FAIL(insert_sql.append_fmt("%s(%lu, %ld, %lu, %.*s, %d, 0, now(6), %ld)",
+                                                 insert_sql.empty() ? "" : ", ",
+                                                 arg.table_id_, new_request, arg.column_id_,
+                                                 static_cast<int>(rowkey_hex.length()),
+                                                 rowkey_hex.ptr(),
+                                                 AI_TASK_STATE_PENDING, arg.spec_version_))) {
+        }
+      }
+    }
+  }
+  ObSqlString stmt;
+  for (int64_t round = 0; OB_SUCC(ret) && round < 2; ++round) {
+    stmt.reuse();
+    if (0 == round && !delete_sql.empty()) {
+      ret = stmt.append_fmt("DELETE FROM %s.%s WHERE %s", OB_SYS_DATABASE_NAME,
+                            "__all_ai_column_task", delete_sql.ptr());
+    } else if (1 == round && !insert_sql.empty()) {
+      ret = stmt.append_fmt("INSERT INTO %s.%s (table_id, request_id, column_id, rowkey_predicate, "
+                            "state, retry_count, eligible_ts, spec_version) VALUES %s",
+                            OB_SYS_DATABASE_NAME, "__all_ai_column_task", insert_sql.ptr());
+    }
+    if (OB_FAIL(ret) || stmt.empty()) {
+    } else if (OB_FAIL(op.check_stack())) {
+    } else if (OB_FAIL(op.begin_nested_session(false))) {
+      LOG_WARN("fail to begin nested session", K(ret));
+    } else {
+      // the task write runs as nested SQL of this statement, the same way foreign key
+      // cascades do, so it commits or rolls back with the row change
+      const bool save_cascading = op.get_exec_ctx().get_das_ctx().is_fk_cascading_;
+      op.get_exec_ctx().get_das_ctx().is_fk_cascading_ = true;
+      if (OB_FAIL(op.execute_write(stmt.ptr()))) {
+        LOG_WARN("fail to maintain ai column task", K(ret), K(stmt));
+      }
+      op.get_exec_ctx().get_das_ctx().is_fk_cascading_ = save_cascading;
+      int end_ret = op.end_nested_session();
+      if (OB_SUCCESS != end_ret) {
+        LOG_WARN("failed to end nested session", K(end_ret));
+        ret = OB_SUCCESS == ret ? end_ret : ret;
+      }
+    }
   }
   return ret;
 }

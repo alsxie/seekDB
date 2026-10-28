@@ -24,6 +24,7 @@
 #include "share/ob_server_struct.h"
 #include "sql/optimizer/ob_optimizer_util.h"
 #include "query/vector/ob_vector_index_util.h"
+#include "sql/resolver/ddl/ob_ai_column_resolver.h"
 #include "sql/resolver/ddl/ob_vec_index_builder_util.h"
 
 namespace oceanbase
@@ -599,6 +600,73 @@ int ObCreateTableResolver::get_resolve_stats_from_table_schema(
   return ret;
 }
 
+int ObCreateTableResolver::resolve_ai_columns(const ParseNode &node,
+                                              const int resolve_rule,
+                                              ObTableSchema &table_schema)
+{
+  int ret = OB_SUCCESS;
+  ObCreateTableStmt *create_table_stmt = static_cast<ObCreateTableStmt *>(stmt_);
+  ObSEArray<ObSEArray<ObString, 4>, 4> deps;
+  ObSArray<share::AiColumnDef> defs;
+  ObSEArray<ObColumnSchemaV2 *, 1> no_new_columns;
+  // pass 1: resolve every AI column so that each result column is flagged before any
+  // dependency is checked, independent of the declaration order
+  for (int64_t i = 0; OB_SUCC(ret) && i < node.num_child_; ++i) {
+    const ParseNode *element = node.children_[i];
+    const ParseNode *ai_node = AiColumnResolver::get_ai_column_node(element);
+    const ParseNode *name_node = NULL;
+    ObColumnSchemaV2 *column = NULL;
+    if (NULL == ai_node) {
+    } else if (RESOLVE_NON_COL == resolve_rule) {
+      // columns were handled by the RESOLVE_COL_ONLY round
+    } else if (RESOLVE_COL_ONLY == resolve_rule) {
+      ret = OB_NOT_SUPPORTED;
+      LOG_USER_ERROR(OB_NOT_SUPPORTED, "AI COLUMN in CREATE TABLE ... AS SELECT");
+    } else if (OB_ISNULL(element->children_[0]) || element->children_[0]->num_child_ < 3
+               || OB_ISNULL(name_node = element->children_[0]->children_[2])) {
+      ret = OB_ERR_UNEXPECTED;
+    } else if (OB_ISNULL(column = table_schema.get_column_schema(
+                   ObString(static_cast<int32_t>(name_node->str_len_), name_node->str_value_)))) {
+      ret = OB_ERR_UNEXPECTED;
+    } else {
+      share::AiColumnDef def;
+      ObSEArray<ObString, 4> dep_names;
+      if (OB_FAIL(AiColumnResolver::resolve_definition(*allocator_, *ai_node, *column, def,
+                                                       dep_names))) {
+      } else if (OB_FAIL(defs.push_back(def))) {
+      } else if (OB_FAIL(deps.push_back(dep_names))) {
+      }
+    }
+  }
+  // pass 2: check dependencies and add hidden bookkeeping columns
+  for (int64_t i = 0; OB_SUCC(ret) && i < defs.count(); ++i) {
+    share::AiColumnDef &def = defs.at(i);
+    const ObColumnSchemaV2 *column = table_schema.get_column_schema(def.column_name_);
+    ObSEArray<ObColumnSchemaV2, 3> hidden_columns;
+    if (OB_ISNULL(column)) {
+      ret = OB_ERR_UNEXPECTED;
+    } else if (OB_FAIL(AiColumnResolver::check_dependencies(table_schema, no_new_columns, def,
+                                                            deps.at(i)))) {
+    } else if (OB_FAIL(AiColumnResolver::build_hidden_columns(*allocator_, *column, def,
+                                                              hidden_columns))) {
+    }
+    for (int64_t j = 0; OB_SUCC(ret) && j < hidden_columns.count(); ++j) {
+      ObColumnSchemaV2 &hidden = hidden_columns.at(j);
+      if (NULL != table_schema.get_column_schema(hidden.get_column_name_str())) {
+        ret = OB_ERR_COLUMN_DUPLICATE;
+        LOG_USER_ERROR(OB_ERR_COLUMN_DUPLICATE, hidden.get_column_name_str().length(),
+                       hidden.get_column_name_str().ptr());
+      } else if (FALSE_IT(hidden.set_column_id(gen_column_id()))) {
+      } else if (OB_FAIL(table_schema.add_column(hidden))) {
+      }
+    }
+    if (OB_SUCC(ret)
+        && OB_FAIL(create_table_stmt->get_create_table_arg().ai_column_defs_.push_back(def))) {
+    }
+  }
+  return ret;
+}
+
 int ObCreateTableResolver::resolve_table_elements(const ParseNode *node,
                                                   ObArray<int> &index_node_position_list,
                                                   ObArray<int> &foreign_key_node_position_list,
@@ -884,6 +952,9 @@ int ObCreateTableResolver::resolve_table_elements(const ParseNode *node,
       }
     }
 
+    if (OB_SUCC(ret) && OB_FAIL(resolve_ai_columns(*node, resolve_rule, table_schema))) {
+      SQL_RESV_LOG(WARN, "fail to resolve ai columns", K(ret));
+    }
     if (OB_SUCC(ret)) {
       for (int32_t i = resolved_cols_count; i < resolved_cols.count() && OB_SUCC(ret); i++) {
         ObColumnSchemaV2 &hidden_col = resolved_cols.at(i);

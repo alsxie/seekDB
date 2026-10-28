@@ -37,6 +37,10 @@ public:
                                 int64_t param_num,
                                 common::ObExprTypeCtx &type_ctx) const override;
   static int eval_ai_embed(const ObExpr &expr, ObEvalCtx &ctx, ObDatum &res);
+  // Rows sharing the same (model, dimension) are sent to the provider in chunks,
+  // results are mapped back to their rows by position.
+  static int eval_ai_embed_batch(const ObExpr &expr, ObEvalCtx &ctx,
+                                 const ObBitVector &skip, const int64_t batch_size);
   virtual int cg_expr(ObExprCGCtx &expr_cg_ctx, 
                       const ObRawExpr &raw_expr,
                       ObExpr &rt_expr) const override;
@@ -45,6 +49,15 @@ private:
   static constexpr int MODEL_IDX = 0;
   static constexpr int CONTENT_IDX = 1;
   static constexpr int DIM_IDX = 2;
+  // upper bounds of a single embedding request
+  static constexpr int64_t MAX_BATCH_ROWS = 64;
+  static constexpr int64_t MAX_BATCH_BYTES = 512 * 1024;
+  static int read_text_arg(const ObExpr &arg_expr, ObEvalCtx &ctx, const ObDatum &datum,
+                           ObIAllocator &allocator, ObString &str);
+  static int get_dimension(const ObDatum *arg_dim, int64_t &dim);
+  static int build_config(ObIAllocator &allocator, const int64_t dim, ObJsonObject *&config);
+  static int call_embedding(ObIAllocator &allocator, const ObString &model_id, const int64_t dim,
+                            ObArray<ObString> &contents, ObArray<ObString> &results);
   DISALLOW_COPY_AND_ASSIGN(ObExprAIEmbed);
 };
 

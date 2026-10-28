@@ -150,7 +150,8 @@ int ObShowResolver::resolve(const ParseNode &parse_tree)
             && OB_UNLIKELY(parse_tree.type_ != T_SHOW_ENGINE)
             && OB_UNLIKELY(parse_tree.type_ != T_SHOW_OPEN_TABLES)
             && OB_UNLIKELY(parse_tree.type_ != T_SHOW_CREATE_USER)
-            && OB_UNLIKELY(parse_tree.type_ != T_SHOW_CHECK_TABLE)) {
+            && OB_UNLIKELY(parse_tree.type_ != T_SHOW_CHECK_TABLE)
+            && OB_UNLIKELY(parse_tree.type_ != T_SHOW_AI_COLUMNS)) {
     ret = OB_ERR_UNEXPECTED;
   } else {
     real_id = 1;
@@ -415,6 +416,29 @@ int ObShowResolver::resolve(const ParseNode &parse_tree)
                 }
               }
             }
+          }
+        }();
+        break;
+      }
+      case T_SHOW_AI_COLUMNS: {
+        [&] {
+          // SHOW AI COLUMNS {FROM | IN} tbl [{FROM | IN} db]  作者：FDE WorkMate
+          ObString show_db_name;
+          uint64_t show_db_id = OB_INVALID_ID;
+          ObString show_table_name;
+          uint64_t show_table_id = OB_INVALID_ID;
+          bool is_view = false;
+          if (OB_UNLIKELY(parse_tree.num_child_ != 2 || NULL == parse_tree.children_)) {
+            ret = OB_ERR_UNEXPECTED;
+          } else if (FALSE_IT(show_resv_ctx.stmt_type_ = stmt::T_SHOW_COLUMNS)) {
+          } else if (OB_FAIL(resolve_show_from_table(parse_tree.children_[0], parse_tree.children_[1],
+                                                     database_name.empty(), T_SHOW_COLUMNS, real_id,
+                                                     show_db_name, show_db_id, show_table_name,
+                                                     show_table_id, is_view))) {
+          } else {
+            GEN_SQL_STEP_1(ObShowSqlSet::SHOW_AI_COLUMNS);
+            GEN_SQL_STEP_2(ObShowSqlSet::SHOW_AI_COLUMNS, OB_SYS_DATABASE_NAME, "__all_ai_column",
+                           show_table_id);
           }
         }();
         break;
@@ -2369,6 +2393,15 @@ DEFINE_SHOW_CLAUSE_SET(SHOW_GLOBAL_VARIABLES,
                        "SELECT /*+parallel(1)*/ variable_name AS `Variable_name`, value AS `Value` FROM %s.%s ORDER BY variable_name ASC",
                        R"(SELECT /*+parallel(1)*/ "VARIABLE_NAME" AS "VARIABLE_NAME", "VALUE" AS "VALUE" FROM %s.%s ORDER BY VARIABLE_NAME ASC)",
                        "Variable_name");
+DEFINE_SHOW_CLAUSE_SET(SHOW_AI_COLUMNS,
+                       NULL,
+                       "SELECT column_name AS `Column`, result_type AS `Type`, function_name AS `Function`, \
+                        model_name AS `Model`, original_expr AS `Expression`, sync_mode AS `Sync_mode`, \
+                        max_retries AS `Max_retries` FROM %s.%s WHERE table_id = %ld ORDER BY column_id",
+                       R"(SELECT "COLUMN_NAME" AS "COLUMN", "RESULT_TYPE" AS "TYPE", "FUNCTION_NAME" AS "FUNCTION", )"
+                       R"("MODEL_NAME" AS "MODEL", "ORIGINAL_EXPR" AS "EXPRESSION", "SYNC_MODE" AS "SYNC_MODE", )"
+                       R"("MAX_RETRIES" AS "MAX_RETRIES" FROM %s.%s WHERE TABLE_ID = %ld ORDER BY COLUMN_ID)",
+                       "Column");
 DEFINE_SHOW_CLAUSE_SET(SHOW_COLUMNS,
                        NULL,
                        "SELECT field AS `Field`, type AS `Type`, `NULL` AS `Null`, `KEY` AS `Key`, `DEFAULT` AS `Default`, extra AS `Extra` \

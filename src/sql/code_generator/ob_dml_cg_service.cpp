@@ -24,6 +24,8 @@
 #include "sql/optimizer/ob_log_update.h"
 #include "sql/das/ob_domain_id.h"
 #include "query/vector/ob_vector_index_util.h"
+#include "share/ai_service/ob_ai_service_struct.h"
+#include "share/ob_server_struct.h"
 
 namespace oceanbase
 {
@@ -2153,6 +2155,7 @@ int ObDmlCgService::generate_dml_base_ctdef(ObLogDelUpd &op,
   if (OB_SUCC(ret) && index_dml_info.is_primary_index_) {
     //add foreign key
     if (OB_FAIL(convert_foreign_keys(op, index_dml_info, dml_base_ctdef))) {
+    } else if (OB_FAIL(convert_ai_column_tasks(op, index_dml_info, dml_base_ctdef))) {
     }
   }
   // Only enable when pl_static_engine is enabled that mysqltest will enable
@@ -2934,6 +2937,94 @@ int ObDmlCgService::generate_fk_scan_ctdef(share::schema::ObSchemaGetterGuard &s
   return ret;
 }
 
+
+// Locates the hidden state / request columns of every AI column in the DML row so that the
+// operator can maintain __all_ai_column_task after each modified row. 作者：FDE WorkMate
+int ObDmlCgService::convert_ai_column_tasks(ObLogDelUpd &op,
+                                            const IndexDMLInfo &index_dml_info,
+                                            ObDMLBaseCtDef &dml_ctdef)
+{
+  int ret = OB_SUCCESS;
+  ObLogPlan *log_plan = NULL;
+  ObSqlSchemaGuard *schema_guard = NULL;
+  const ObTableSchema *table_schema = NULL;
+  bool has_ai_column = false;
+  ObSEArray<share::AiColumnMeta, 4> metas;
+  ObSEArray<ObAiColumnTaskArg, 4> args;
+  ObSEArray<ObForeignKeyColumn, 4> rowkey_columns;
+  if (OB_ISNULL(log_plan = op.get_plan()) || OB_ISNULL(cg_.phy_plan_) ||
+      OB_ISNULL(schema_guard = log_plan->get_optimizer_context().get_sql_schema_guard())) {
+    ret = OB_INVALID_ARGUMENT;
+  } else if (OB_FAIL(schema_guard->get_table_schema(index_dml_info.ref_table_id_, table_schema))) {
+  } else if (OB_ISNULL(table_schema)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (!table_schema->is_user_table()) {
+  } else {
+    for (ObTableSchema::const_column_iterator it = table_schema->column_begin();
+         !has_ai_column && it != table_schema->column_end(); ++it) {
+      has_ai_column = NULL != *it && (*it)->is_ai_result_column();
+    }
+  }
+  if (OB_FAIL(ret) || !has_ai_column) {
+  } else if (OB_ISNULL(GCTX.sql_proxy_)) {
+    ret = OB_NOT_INIT;
+  } else if (OB_FAIL(share::AiColumnMetaCache::get_instance().get(
+                 *GCTX.sql_proxy_, table_schema->get_table_id(),
+                 table_schema->get_schema_version(), metas))) {
+    LOG_WARN("fail to get ai column meta", K(ret));
+  } else {
+    auto find_idx = [&](const uint64_t column_id) -> int32_t {
+      int32_t idx = -1;
+      for (int64_t i = 0; idx < 0 && i < dml_ctdef.column_ids_.count(); ++i) {
+        if (dml_ctdef.column_ids_.at(i) == column_id) {
+          idx = static_cast<int32_t>(i);
+        }
+      }
+      return idx;
+    };
+    for (int64_t i = 0; OB_SUCC(ret) && i < metas.count(); ++i) {
+      ObAiColumnTaskArg arg;
+      arg.table_id_ = table_schema->get_table_id();
+      arg.column_id_ = metas.at(i).column_id_;
+      arg.spec_version_ = metas.at(i).spec_version_;
+      arg.state_idx_ = find_idx(metas.at(i).state_column_id_);
+      arg.request_idx_ = find_idx(metas.at(i).request_column_id_);
+      if (NULL == table_schema->get_column_schema(arg.column_id_)) {
+        // stale metadata of a dropped column
+      } else if (arg.state_idx_ < 0 || arg.request_idx_ < 0) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("ai hidden column is not part of the dml row", K(ret), K(arg), K(metas.at(i)));
+      } else if (OB_FAIL(args.push_back(arg))) {
+      }
+    }
+    const ObRowkeyInfo &rowkey_info = table_schema->get_rowkey_info();
+    for (int64_t i = 0; OB_SUCC(ret) && args.count() > 0 && i < rowkey_info.get_size(); ++i) {
+      uint64_t column_id = OB_INVALID_ID;
+      const ObColumnSchemaV2 *col = NULL;
+      ObForeignKeyColumn rowkey_col;
+      if (OB_FAIL(rowkey_info.get_column_id(i, column_id))) {
+      } else if (OB_ISNULL(col = table_schema->get_column_schema(column_id))) {
+        ret = OB_ERR_UNEXPECTED;
+      } else if (OB_FAIL(ob_write_string(cg_.phy_plan_->get_allocator(),
+                                         col->get_column_name_str(), rowkey_col.name_))) {
+      } else if ((rowkey_col.idx_ = find_idx(column_id)) < 0) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("rowkey column is not part of the dml row", K(ret), K(column_id));
+      } else {
+        rowkey_col.name_idx_ = rowkey_col.idx_;
+        rowkey_col.obj_meta_ = col->get_meta_type();
+        ret = rowkey_columns.push_back(rowkey_col);
+      }
+    }
+    if (OB_FAIL(ret) || args.count() <= 0) {
+    } else if (OB_FAIL(dml_ctdef.ai_task_args_.assign(args))) {
+    } else if (OB_FAIL(dml_ctdef.ai_rowkey_columns_.assign(rowkey_columns))) {
+    } else {
+      cg_.phy_plan_->set_has_nested_sql(true);
+    }
+  }
+  return ret;
+}
 
 int ObDmlCgService::convert_foreign_keys(ObLogDelUpd &op,
                                          const IndexDMLInfo &index_dml_info,

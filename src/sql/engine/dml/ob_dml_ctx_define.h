@@ -345,6 +345,29 @@ public:
 };
 typedef common::ObFixedArray<ObForeignKeyArg, common::ObIAllocator> ObForeignKeyArgArray;
 
+// One AI column of the modified table: where its hidden state and request columns live in the
+// DML rows, so that the after-row hook can keep __all_ai_column_task in step with the row in the
+// same transaction. 作者：FDE WorkMate
+struct ObAiColumnTaskArg
+{
+  OB_UNIS_VERSION(1);
+public:
+  ObAiColumnTaskArg()
+    : table_id_(common::OB_INVALID_ID),
+      column_id_(common::OB_INVALID_ID),
+      state_idx_(-1),
+      request_idx_(-1),
+      spec_version_(0)
+  {}
+  TO_STRING_KV(K_(table_id), K_(column_id), K_(state_idx), K_(request_idx), K_(spec_version));
+  uint64_t table_id_;
+  uint64_t column_id_;
+  int32_t state_idx_;
+  int32_t request_idx_;
+  int64_t spec_version_;
+};
+typedef common::ObFixedArray<ObAiColumnTaskArg, common::ObIAllocator> ObAiColumnTaskArgArray;
+
 struct ColumnContent
 {
   OB_UNIS_VERSION(1);
@@ -438,6 +461,9 @@ public:
   bool reserved_advanced_trigger_;
   ObExpr *trans_info_expr_;
   bool is_vec_hnsw_index_vid_opt_;
+  // AI columns of the table (primary index only) and the rowkey columns used to address a row
+  ObAiColumnTaskArgArray ai_task_args_;
+  common::ObFixedArray<ObForeignKeyColumn, common::ObIAllocator> ai_rowkey_columns_;
 protected:
   ObDMLBaseCtDef(common::ObIAllocator &alloc,
                  ObDASDMLBaseCtDef &das_base_ctdef,
@@ -456,7 +482,9 @@ protected:
       is_table_without_pk_(false),
       reserved_advanced_trigger_(false),
       trans_info_expr_(nullptr),
-      is_vec_hnsw_index_vid_opt_(false)
+      is_vec_hnsw_index_vid_opt_(false),
+      ai_task_args_(alloc),
+      ai_rowkey_columns_(alloc)
   { }
 };
 

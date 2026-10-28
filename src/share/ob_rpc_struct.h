@@ -48,6 +48,7 @@
 #include "ob_ddl_args.h"
 #include "share/inner_table/ob_load_inner_table_schema.h"
 #include "share/ai_service/ob_ai_model_info.h"
+#include "share/ai_service/ob_ai_service_struct.h"
 
 namespace oceanbase
 {
@@ -1302,6 +1303,8 @@ public:
   int64_t lock_session_create_ts_;
   transaction::tablelock::ObTableLockPriority lock_priority_;
   uint64_t data_version_;
+  // AI columns added by this ALTER TABLE, persisted inside the DDL transaction
+  common::ObSArray<share::AiColumnDef> ai_column_defs_;
   int serialize_index_args(char *buf, const int64_t data_len, int64_t &pos) const;
   int deserialize_index_args(const char *buf, const int64_t data_len, int64_t &pos);
   int64_t get_index_args_serialize_size() const;
@@ -1948,6 +1951,8 @@ public:
   share::schema::ObErrorInfo error_info_;
   bool is_alter_view_;
   common::ObSArray<oceanbase::share::schema::ObDependencyInfo> dep_infos_;
+  // AI columns of the new table, persisted inside the DDL transaction
+  common::ObSArray<share::AiColumnDef> ai_column_defs_;
 };
 
 

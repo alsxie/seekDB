@@ -751,9 +751,46 @@ int ObAlterTableExecutor::alter_table_exchange_partition_rpc(obcall::ObExchangeP
   return ret;
 }
 
+// Runs the AI column restart statements of an ALTER TABLE as internal SQL. Freshly added
+// columns may need a moment until the new schema is visible to the internal session.
+// 作者：FDE WorkMate
+static int execute_ai_column_sqls(ObExecContext &ctx, ObAlterTableStmt &stmt)
+{
+  int ret = OB_SUCCESS;
+  ObSQLSessionInfo *session = ctx.get_my_session();
+  if (OB_ISNULL(session) || OB_ISNULL(GCTX.sql_proxy_)) {
+    ret = OB_NOT_INIT;
+  }
+  for (int64_t i = 0; OB_SUCC(ret) && i < stmt.ai_column_sqls_.count(); ++i) {
+    ObSqlString sql;
+    int64_t affected_rows = 0;
+    if (OB_FAIL(sql.assign(stmt.ai_column_sqls_.at(i)))) {
+    } else {
+      static const int64_t MAX_ATTEMPTS = 50;
+      for (int64_t attempt = 0; attempt < MAX_ATTEMPTS; ++attempt) {
+        ret = GCTX.sql_proxy_->write(sql.ptr(), affected_rows);
+        if (OB_ERR_BAD_FIELD_ERROR != ret || attempt + 1 == MAX_ATTEMPTS) {
+          break;
+        }
+        ob_usleep(100 * 1000);
+      }
+      if (OB_FAIL(ret)) {
+        LOG_WARN("fail to restart ai column requests", K(ret), K(sql));
+      } else {
+        LOG_INFO("restarted ai column requests", K(sql), K(affected_rows));
+      }
+    }
+  }
+  return ret;
+}
+
 int ObAlterTableExecutor::execute(ObExecContext &ctx, ObAlterTableStmt &stmt)
 {
   int ret = OB_SUCCESS;
+  if (stmt.is_ai_column_retry_) {
+    // RETRY AI COLUMN changes data only, no DDL is involved
+    return execute_ai_column_sqls(ctx, stmt);
+  }
   ObSqlExecutorCtx *task_exec_ctx = NULL;
   obcall::ObAlterTableArg &alter_table_arg = stmt.get_alter_table_arg();
   obcall::ObExchangePartitionArg &exchange_partition_arg = stmt.get_exchange_partition_arg();
@@ -878,6 +915,9 @@ int ObAlterTableExecutor::execute(ObExecContext &ctx, ObAlterTableStmt &stmt)
       "table_info", table_info_buffer,
       "schema_version", res.schema_version_);
     SQL_ENG_LOG(INFO, "finish alter table execute.", K(ret), "ddl_event_info", ObDDLEventInfo(GCTX.self_addr()), K(first_stmt));
+  }
+  if (OB_SUCC(ret) && stmt.ai_column_sqls_.count() > 0
+      && OB_FAIL(execute_ai_column_sqls(ctx, stmt))) {
   }
   return ret;
 }

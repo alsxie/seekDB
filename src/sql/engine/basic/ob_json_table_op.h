@@ -33,6 +33,10 @@ namespace oceanbase
 {
 namespace sql
 {
+namespace file_sql
+{
+class FileTableExecutor;
+}
 struct JtScanCtx;
 class ObExpr;
 struct JtScanCtx;
@@ -49,6 +53,7 @@ enum table_type : int8_t {
   OB_JSON_TABLE = 1,
   OB_XML_TABLE = 2,
   OB_UNNEST_TABLE = 3,
+  OB_FILE_TABLE = 4,
 };
 
 typedef enum JtNodeType {
@@ -194,6 +199,7 @@ public:
       is_inited_(false),
       is_evaled_(false),
       root_(nullptr),
+      file_exec_(nullptr),
       input_(nullptr),
       j_null_(),
       j_arr_(allocator_),
@@ -237,6 +243,15 @@ private:
   bool is_evaled_;
   JoinNode* root_;  // mul mode table
   JtScanCtx jt_ctx_;
+  file_sql::FileTableExecutor *file_exec_;  // read_csv / read_json / read_parquet / glob
+
+  bool is_file_table() const
+  {
+    return MulModeTableType::OB_FILE_TABLE_TYPE
+           == reinterpret_cast<const ObJsonTableSpec*>(&spec_)->table_type_;
+  }
+  int open_file_table();
+  void destroy_file_table();
 
 public:
   void *input_;   // mul mode table

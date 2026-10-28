@@ -30,6 +30,7 @@
 #include "sql/parser/ob_parser_utils.h"
 
 #include "sql/executor/ob_memory_tracker.h"
+#include "sql/engine/basic/file_sql/file_copy_writer.h"
 namespace oceanbase
 {
 using namespace common;
@@ -3044,6 +3045,47 @@ int ObSelectResolver::resolve_into_outfile_with_format(const ParseNode *node, Ob
   return ret;
 }
 
+int ObSelectResolver::resolve_copy_into(const ParseNode *node, ObSelectIntoItem &into_item)
+{
+  int ret = OB_SUCCESS;
+  int64_t enable_file_sql = 0;
+  ObSelectStmt *select_stmt = get_select_stmt();
+  ObSEArray<file_sql::FileOption, 8> options;
+  file_sql::CopyDesc desc;
+  ObString secure_file_priv;
+  ObString target;
+  if (OB_ISNULL(node) || 6 != node->num_child_ || OB_ISNULL(node->children_[0])
+      || (T_VARCHAR != node->children_[0]->type_ && T_CHAR != node->children_[0]->type_)
+      || OB_ISNULL(select_stmt) || OB_ISNULL(session_info_) || OB_ISNULL(params_.query_ctx_)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (OB_FAIL(session_info_->get_sys_variable(share::SYS_VAR_ENABLE_FILE_SQL, enable_file_sql))) {
+    LOG_WARN("failed to get enable_file_sql", K(ret));
+  } else if (0 == enable_file_sql) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "COPY when enable_file_sql is OFF");
+  } else if (FALSE_IT(target.assign_ptr(node->children_[0]->str_value_,
+                                       static_cast<int32_t>(node->children_[0]->str_len_)))) {
+  } else if (OB_FAIL(resolve_file_sql_options(node->children_[5], options))) {
+  } else if (OB_FAIL(session_info_->get_secure_file_priv(secure_file_priv))) {
+  } else if (OB_FAIL(file_sql::build_copy_desc(*allocator_, target, options, secure_file_priv, desc))) {
+    LOG_WARN("invalid COPY", K(ret));
+  }
+  for (int64_t i = 0; OB_SUCC(ret) && i < select_stmt->get_select_item_size(); ++i) {
+    if (OB_FAIL(desc.columns_.push_back(select_stmt->get_select_item(i).alias_name_))) {
+    }
+  }
+  if (OB_FAIL(ret)) {
+  } else if (OB_FAIL(desc.serialize(*allocator_, into_item.copy_options_))) {
+  } else {
+    into_item.outfile_name_.set_varchar(desc.path_);
+    into_item.outfile_name_.set_collation_type(CS_TYPE_UTF8MB4_BIN);
+    into_item.is_single_ = true;
+    // The target must be checked again on every execution.
+    params_.query_ctx_->has_file_table_ = true;
+  }
+  return ret;
+}
+
 int ObSelectResolver::resolve_into_outfile_without_format(const ParseNode *node,
                                                           ObSelectIntoItem &into_item)
 {
@@ -3107,6 +3149,10 @@ int ObSelectResolver::resolve_into_clause(const ParseNode *node)
       if (T_INTO_OUTFILE == node->type_) { // into outfile
         if (is_in_set_query()) {
           ret = OB_INAPPROPRIATE_INTO;
+        } else if (6 == node->num_child_) {  // COPY ... TO
+          if (OB_FAIL(resolve_copy_into(node, *into_item))) {
+            LOG_WARN("failed to resolve COPY", K(ret));
+          }
         } else if (node->num_child_ == 3 && NULL != node->children_[1]
             && T_EXTERNAL_FILE_FORMAT == node->children_[1]->type_) { // Handle with `FORMAT`
           if (OB_FAIL(resolve_into_outfile_with_format(node, *into_item))) {

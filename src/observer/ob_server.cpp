@@ -99,6 +99,7 @@ int ObServer::get_lower_bound_freeze_info(const int64_t snapshot_version, share:
 #include "rpc/ob_request.h"
 #include "storage/blocksstable/ob_block_sstable_struct.h"
 #include "standby/standby_module.h"
+#include "observer/ai_service/ob_ai_column_worker.h"
 
 using namespace oceanbase::lib;
 using namespace oceanbase::common;
@@ -1349,6 +1350,11 @@ int ObServer::start()
   } else if (!stop_) {
     GCTX.status_ = SS_SERVING;
     GCTX.start_service_time_ = start_service_time;
+    // AI column background requests, best effort: a failure only delays AI results
+    int ai_ret = ObAiColumnWorker::get_instance().start_worker();
+    if (OB_SUCCESS != ai_ret) {
+      LOG_WARN("fail to start ai column worker", K(ai_ret));
+    }
     FLOG_INFO("[OBSERVER_NOTICE] observer start service", "start_service_time", GCTX.start_service_time_);
     LOG_DBA_INFO_V2(OB_SERVER_START_SUCCESS,
                     DBA_STEP_INC_INFO(server_start),
@@ -1578,6 +1584,10 @@ int ObServer::stop()
     FLOG_INFO("begin stop signal handle");
     signal_handle_.stop();
     FLOG_INFO("stop signal handle success");
+
+    FLOG_INFO("begin to stop ai column worker");
+    ObAiColumnWorker::get_instance().stop_worker();
+    FLOG_INFO("stop ai column worker success");
 
     FLOG_INFO("begin to stop GDS");
     GDS.stop();

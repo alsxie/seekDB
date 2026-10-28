@@ -373,6 +373,9 @@ private:
   int convert_foreign_keys(ObLogDelUpd &op,
                            const IndexDMLInfo &index_dml_info,
                            ObDMLBaseCtDef &dml_ctdef);
+  int convert_ai_column_tasks(ObLogDelUpd &op,
+                              const IndexDMLInfo &index_dml_info,
+                              ObDMLBaseCtDef &dml_ctdef);
   int generate_related_ins_ctdef(ObLogDelUpd &op,
                                  const common::ObIArray<common::ObTableID> &related_tids,
                                  const IndexDMLInfo &index_dml_info,

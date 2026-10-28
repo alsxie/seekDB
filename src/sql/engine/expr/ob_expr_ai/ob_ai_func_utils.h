@@ -124,6 +124,18 @@ public:
     DISALLOW_COPY_AND_ASSIGN(ObOllamaEmbed);
   };
   static int get_header(common::ObIAllocator &allocator, common::ObArray<ObString> &headers);
+  // Ollama does not require authentication; a non-empty key is still forwarded
+  // so that Ollama instances behind an authenticating proxy keep working.
+  static int get_header(common::ObIAllocator &allocator,
+                        const common::ObString &api_key,
+                        common::ObArray<ObString> &headers);
+  static constexpr const char *CHAT_API_PATH = "/api/chat";
+  // true when the url path ends with the given api path (case insensitive)
+  static bool is_api_path(const common::ObString &url, const char *path);
+  // Translate OpenAI style generation parameters to the native Ollama request.
+  static int apply_generate_config(common::ObIAllocator &allocator,
+                                   common::ObJsonObject *config,
+                                   common::ObJsonObject *body);
   DISALLOW_COPY_AND_ASSIGN(ObOllamaUtils);
 };
 
@@ -245,6 +257,10 @@ public:
   static int get_json_object_form_str(ObIAllocator &allocator, ObString &str, ObJsonObject *&obj_node);
   static int print_json_to_str(ObIAllocator &allocator, ObIJsonBase *base_node, ObString &str);
   static int compact_json_object(ObIAllocator &allocator, ObJsonObject *obj_node, ObJsonObject *compact_obj);
+  // Reads a JSON number (int, uint, double, decimal, ...) as double.
+  static int get_number_value(const ObIJsonBase *node, double &value);
+  // Reads a non-negative integral JSON number.
+  static int get_index_value(const ObIJsonBase *node, int64_t &value);
 private:
   DISALLOW_COPY_AND_ASSIGN(ObAIFuncJsonUtils);
 };
@@ -291,6 +307,13 @@ public:
   static int get_complete_provider(ObIAllocator &allocator, const ObString &provider, ObAIFuncIComplete *&complete_provider);
   static int get_embed_provider(ObIAllocator &allocator, const ObString &provider, ObAIFuncIEmbed *&embed_provider);
   static int get_rerank_provider(ObIAllocator &allocator, const ObString &provider, ObAIFuncIRerank *&rerank_provider);
+  // same as above and binds the endpoint url to the provider
+  static int get_complete_provider(ObIAllocator &allocator, const share::ObAiModelEndpointInfo &endpoint_info,
+                                   ObAIFuncIComplete *&complete_provider);
+  static int get_embed_provider(ObIAllocator &allocator, const share::ObAiModelEndpointInfo &endpoint_info,
+                                ObAIFuncIEmbed *&embed_provider);
+  static int get_rerank_provider(ObIAllocator &allocator, const share::ObAiModelEndpointInfo &endpoint_info,
+                                 ObAIFuncIRerank *&rerank_provider);
   static int get_header(ObIAllocator &allocator,
                         const ObAIFuncExprInfo &info,
                         const share::ObAiModelEndpointInfo &endpoint_info,
@@ -329,6 +352,10 @@ public:
                                  ObJsonObject *http_response,
                                  ObIJsonBase *&result);
   static int set_string_result(const ObExpr &expr, ObEvalCtx &ctx, ObDatum &res, ObString &res_str);
+  // completion output must be a non-null and non-empty value
+  static int check_completion_output(const ObIJsonBase *output);
+  // vector must be a non-empty array of finite numbers; expected_dim > 0 enforces its length
+  static int check_embedding_vector(const ObIJsonBase *vector, const int64_t expected_dim, int64_t &dim);
   static bool is_provider_support_base64(const ObString &provider);
   static int decode_base64_embedding_array(const ObIJsonBase &embedding_jbase, ObIAllocator &allocator,
                                            const int64_t dimension, float *&vector);
@@ -381,7 +408,15 @@ public:
   static int construct_prompt_object(ObIAllocator &allocator, ObString &template_str, ObJsonArray *args_array, ObJsonObject *&prompt_object);
   static constexpr char prompt_template_key[20] = "template";
   static constexpr char prompt_args_key[20] = "args";
+  // nested prompt objects deeper than this are rejected to bound recursion
+  static constexpr int64_t MAX_PROMPT_NESTED_DEPTH = 16;
 private:
+  static int render_prompt_object(ObIAllocator &allocator, ObJsonObject *prompt_object,
+                                  const int64_t depth, ObStringBuffer &result);
+  static int render_prompt_arg(ObIAllocator &allocator, ObJsonNode *arg_node,
+                               const int64_t depth, ObStringBuffer &result);
+  static bool parse_placeholder(const ObString &template_str, const int64_t start_pos,
+                                int64_t &index, int64_t &end_pos);
   DISALLOW_COPY_AND_ASSIGN(ObAIFuncPromptObjectUtils);
 };
 
