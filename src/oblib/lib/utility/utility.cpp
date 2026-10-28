@@ -17,6 +17,7 @@
 #define USING_LOG_PREFIX LIB
 
 #include "utility.h"
+#include "lib/utility/ob_cpu_limit.h"
 #include "dirent.h"
 #if defined(__APPLE__)
 #include <sys/sysctl.h>
@@ -26,6 +27,8 @@
 #include <gnu/libc-version.h>
 #include <errno.h>
 #include <limits.h>
+#include <sched.h>
+#include <unistd.h>
 #endif
 #ifdef _WIN32
 #include <windows.h>
@@ -178,7 +181,10 @@ void set_default_cgroup_mount(const char *mount_point, CgroupMountInfo &mount_in
   mount_info.match_score_ = mount_info.valid_ ? 0 : -1;
 }
 
+// v1_controller names the cgroup v1 controller hierarchy to follow ("memory", "cpu");
+// cgroup v2 has a single unified hierarchy.
 bool read_cgroup_paths(const char *cgroup_path,
+                       const char *v1_controller,
                        char *cgroup_v1_path,
                        const int64_t cgroup_v1_path_size,
                        char *cgroup_v2_path,
@@ -203,7 +209,7 @@ bool read_cgroup_paths(const char *cgroup_path,
           found_path = copy_path(
               group_path, cgroup_v2_path, cgroup_v2_path_size) || found_path;
         } else if ('/' == group_path[0] &&
-                   controller_list_contains(controllers, "memory")) {
+                   controller_list_contains(controllers, v1_controller)) {
           found_path = copy_path(
               group_path, cgroup_v1_path, cgroup_v1_path_size) || found_path;
         }
@@ -215,6 +221,7 @@ bool read_cgroup_paths(const char *cgroup_path,
 }
 
 void find_cgroup_mounts(const char *mountinfo_path,
+                        const char *v1_controller,
                         const char *cgroup_v1_path,
                         const char *cgroup_v2_path,
                         CgroupMountInfo &cgroup_v1_mount,
@@ -251,7 +258,7 @@ void find_cgroup_mounts(const char *mountinfo_path,
                 root, mount_point, cgroup_v2_path, cgroup_v2_mount);
           } else if ('\0' != cgroup_v1_path[0] &&
                      0 == strcmp(file_system_type, "cgroup") &&
-                     controller_list_contains(super_options, "memory")) {
+                     controller_list_contains(super_options, v1_controller)) {
             (void)init_cgroup_mount(
                 root, mount_point, cgroup_v1_path, cgroup_v1_mount);
           }
@@ -318,9 +325,129 @@ bool read_cgroup_memory_limit(const char *path, int64_t &limit)
   return found;
 }
 
+// Reads the limit one cgroup directory sets on a resource; false when the directory sets none.
+typedef bool (*CgroupLimitReader)(const char *group_dir, int64_t &limit);
+
+bool get_cgroup_file_path(const char *group_dir,
+                          const char *file_name,
+                          char *path,
+                          const int64_t path_size)
+{
+  const int path_length = snprintf(path, path_size, "%s/%s", group_dir, file_name);
+  return path_length > 0 && path_length < path_size;
+}
+
+bool read_cgroup_v2_memory_limit(const char *group_dir, int64_t &limit)
+{
+  char path[PATH_MAX] = {0};
+  return get_cgroup_file_path(group_dir, "memory.max", path, sizeof(path)) &&
+         read_cgroup_memory_limit(path, limit);
+}
+
+bool read_cgroup_v1_memory_limit(const char *group_dir, int64_t &limit)
+{
+  char path[PATH_MAX] = {0};
+  return get_cgroup_file_path(group_dir, "memory.limit_in_bytes", path, sizeof(path)) &&
+         read_cgroup_memory_limit(path, limit);
+}
+
+// Reads the first line of a cgroup file without its surrounding white space.
+bool read_cgroup_line(const char *path, char *line, const int64_t line_size)
+{
+  bool found = false;
+  FILE *file = fopen(path, "r");
+  if (nullptr != file) {
+    if (nullptr != fgets(line, static_cast<int>(line_size), file)) {
+      char *line_begin = line;
+      while (isspace(static_cast<unsigned char>(*line_begin))) {
+        ++line_begin;
+      }
+      char *line_end = line_begin + strlen(line_begin);
+      while (line_end > line_begin && isspace(static_cast<unsigned char>(line_end[-1]))) {
+        --line_end;
+      }
+      *line_end = '\0';
+      memmove(line, line_begin, line_end - line_begin + 1);
+      found = '\0' != line[0];
+    }
+    fclose(file);
+  }
+  return found;
+}
+
+bool parse_cgroup_integer(const char *text, int64_t &value)
+{
+  bool succeeded = nullptr != text;
+  if (succeeded) {
+    char *parsed_end = nullptr;
+    errno = 0;
+    const long long parsed = strtoll(text, &parsed_end, 10);
+    succeeded = 0 == errno && parsed_end != text && '\0' == *parsed_end;
+    if (succeeded) {
+      value = static_cast<int64_t>(parsed);
+    }
+  }
+  return succeeded;
+}
+
+// A CFS quota of quota_us per period_us lets the group run quota_us / period_us CPUs at the same
+// time.  A fraction still needs a whole CPU to run on, so the milli-CPU count is rounded up.
+bool cgroup_cpu_quota_to_milli_cpus(const int64_t quota_us,
+                                    const int64_t period_us,
+                                    int64_t &milli_cpus)
+{
+  const bool limited = quota_us > 0 && period_us > 0 &&
+                       quota_us <= (INT64_MAX - period_us) / 1000;
+  if (limited) {
+    milli_cpus = (quota_us * 1000 + period_us - 1) / period_us;
+  }
+  return limited;
+}
+
+// cgroup v2: cpu.max holds "<quota> <period>", the quota being "max" when it is unlimited.
+bool read_cgroup_v2_cpu_limit(const char *group_dir, int64_t &milli_cpus)
+{
+  bool found = false;
+  char path[PATH_MAX] = {0};
+  char line[128] = {0};
+  if (get_cgroup_file_path(group_dir, "cpu.max", path, sizeof(path)) &&
+      read_cgroup_line(path, line, sizeof(line))) {
+    char *save_ptr = nullptr;
+    const char *quota = strtok_r(line, " \t", &save_ptr);
+    const char *period = strtok_r(nullptr, " \t", &save_ptr);
+    int64_t quota_us = 0;
+    int64_t period_us = 0;
+    found = nullptr != quota && nullptr != period && 0 != strcmp(quota, "max") &&
+            parse_cgroup_integer(quota, quota_us) &&
+            parse_cgroup_integer(period, period_us) &&
+            cgroup_cpu_quota_to_milli_cpus(quota_us, period_us, milli_cpus);
+  }
+  return found;
+}
+
+// cgroup v1: cpu.cfs_quota_us is -1 when it is unlimited, cpu.cfs_period_us holds the period.
+bool read_cgroup_v1_cpu_limit(const char *group_dir, int64_t &milli_cpus)
+{
+  char quota_path[PATH_MAX] = {0};
+  char period_path[PATH_MAX] = {0};
+  char quota[64] = {0};
+  char period[64] = {0};
+  int64_t quota_us = 0;
+  int64_t period_us = 0;
+  return get_cgroup_file_path(group_dir, "cpu.cfs_quota_us", quota_path, sizeof(quota_path)) &&
+         get_cgroup_file_path(group_dir, "cpu.cfs_period_us", period_path, sizeof(period_path)) &&
+         read_cgroup_line(quota_path, quota, sizeof(quota)) &&
+         read_cgroup_line(period_path, period, sizeof(period)) &&
+         parse_cgroup_integer(quota, quota_us) &&
+         parse_cgroup_integer(period, period_us) &&
+         cgroup_cpu_quota_to_milli_cpus(quota_us, period_us, milli_cpus);
+}
+
+// Lowers minimum_limit to the smallest limit set along the hierarchy from the group of the
+// process up to the root of the mount: a parent's limit caps all of its descendants.
 void update_cgroup_hierarchy_limit(const CgroupMountInfo &mount_info,
                                    const char *group_path,
-                                   const char *limit_file,
+                                   const CgroupLimitReader read_limit,
                                    int64_t &minimum_limit)
 {
   char current_path[PATH_MAX] = {0};
@@ -328,15 +455,14 @@ void update_cgroup_hierarchy_limit(const CgroupMountInfo &mount_info,
           mount_info, group_path, current_path, sizeof(current_path))) {
     bool finished = false;
     while (!finished) {
-      char limit_path[PATH_MAX] = {0};
+      char group_dir[PATH_MAX] = {0};
       const int path_length = 0 == strcmp(current_path, "/")
-          ? snprintf(limit_path, sizeof(limit_path), "%s/%s",
-                     mount_info.mount_point_, limit_file)
-          : snprintf(limit_path, sizeof(limit_path), "%s%s/%s",
-                     mount_info.mount_point_, current_path, limit_file);
+          ? snprintf(group_dir, sizeof(group_dir), "%s", mount_info.mount_point_)
+          : snprintf(group_dir, sizeof(group_dir), "%s%s",
+                     mount_info.mount_point_, current_path);
       int64_t current_limit = 0;
-      if (path_length > 0 && path_length < static_cast<int>(sizeof(limit_path)) &&
-          read_cgroup_memory_limit(limit_path, current_limit) &&
+      if (path_length > 0 && path_length < static_cast<int>(sizeof(group_dir)) &&
+          read_limit(group_dir, current_limit) &&
           current_limit < minimum_limit) {
         minimum_limit = current_limit;
       }
@@ -352,23 +478,26 @@ void update_cgroup_hierarchy_limit(const CgroupMountInfo &mount_info,
     }
   }
 }
-} // namespace
-#endif
 
-#if defined(__linux__) && !defined(__ANDROID__)
-int64_t get_cgroup_memory_limit(
-    const char *proc_cgroup_path, const char *proc_mountinfo_path)
+// The smallest finite limit on a resource along the cgroup hierarchy of the process, or 0 when
+// there is none.  v1_controller names the cgroup v1 hierarchy that carries the resource.
+int64_t get_cgroup_limit(const char *proc_cgroup_path,
+                         const char *proc_mountinfo_path,
+                         const char *v1_controller,
+                         const char *v1_default_mount_point,
+                         const CgroupLimitReader read_v2_limit,
+                         const CgroupLimitReader read_v1_limit)
 {
   int64_t minimum_limit = 0;
   if (nullptr != proc_cgroup_path && nullptr != proc_mountinfo_path) {
     char cgroup_v1_path[PATH_MAX] = {0};
     char cgroup_v2_path[PATH_MAX] = {0};
-    if (read_cgroup_paths(proc_cgroup_path,
+    if (read_cgroup_paths(proc_cgroup_path, v1_controller,
                           cgroup_v1_path, sizeof(cgroup_v1_path),
                           cgroup_v2_path, sizeof(cgroup_v2_path))) {
       CgroupMountInfo cgroup_v1_mount;
       CgroupMountInfo cgroup_v2_mount;
-      find_cgroup_mounts(proc_mountinfo_path,
+      find_cgroup_mounts(proc_mountinfo_path, v1_controller,
                          cgroup_v1_path, cgroup_v2_path,
                          cgroup_v1_mount, cgroup_v2_mount);
       if ('\0' != cgroup_v2_path[0]) {
@@ -377,18 +506,17 @@ int64_t get_cgroup_memory_limit(
         }
         minimum_limit = INT64_MAX;
         update_cgroup_hierarchy_limit(
-            cgroup_v2_mount, cgroup_v2_path, "memory.max", minimum_limit);
+            cgroup_v2_mount, cgroup_v2_path, read_v2_limit, minimum_limit);
       }
       if ('\0' != cgroup_v1_path[0]) {
         if (!cgroup_v1_mount.valid_) {
-          set_default_cgroup_mount("/sys/fs/cgroup/memory", cgroup_v1_mount);
+          set_default_cgroup_mount(v1_default_mount_point, cgroup_v1_mount);
         }
         if (0 == minimum_limit) {
           minimum_limit = INT64_MAX;
         }
         update_cgroup_hierarchy_limit(
-            cgroup_v1_mount, cgroup_v1_path,
-            "memory.limit_in_bytes", minimum_limit);
+            cgroup_v1_mount, cgroup_v1_path, read_v1_limit, minimum_limit);
       }
       if (INT64_MAX == minimum_limit) {
         minimum_limit = 0;
@@ -397,6 +525,45 @@ int64_t get_cgroup_memory_limit(
   }
   return minimum_limit;
 }
+} // namespace
+#endif
+
+#if defined(__linux__) && !defined(__ANDROID__)
+int64_t get_cgroup_memory_limit(
+    const char *proc_cgroup_path, const char *proc_mountinfo_path)
+{
+  return get_cgroup_limit(proc_cgroup_path, proc_mountinfo_path,
+                          "memory", "/sys/fs/cgroup/memory",
+                          read_cgroup_v2_memory_limit, read_cgroup_v1_memory_limit);
+}
+
+// 作者：FDE WorkMate
+int64_t get_cgroup_cpu_limit(
+    const char *proc_cgroup_path, const char *proc_mountinfo_path)
+{
+  return get_cgroup_limit(proc_cgroup_path, proc_mountinfo_path,
+                          "cpu", "/sys/fs/cgroup/cpu",
+                          read_cgroup_v2_cpu_limit, read_cgroup_v1_cpu_limit);
+}
+
+int64_t get_available_cpu_num()
+{
+  int64_t cpu_num = get_cpu_num();
+  cpu_set_t cpu_set;
+  CPU_ZERO(&cpu_set);
+  // the affinity of the main thread is the cpu set the process was started on
+  if (0 == sched_getaffinity(getpid(), sizeof(cpu_set), &cpu_set)) {
+    const int64_t affinity_cpu_num = CPU_COUNT(&cpu_set);
+    if (affinity_cpu_num > 0 && affinity_cpu_num < cpu_num) {
+      cpu_num = affinity_cpu_num;
+    }
+  }
+  const int64_t cgroup_cpu_num = (get_cgroup_cpu_limit() + 999) / 1000;
+  if (cgroup_cpu_num > 0 && cgroup_cpu_num < cpu_num) {
+    cpu_num = cgroup_cpu_num;
+  }
+  return cpu_num > 0 ? cpu_num : 1;
+}
 #else
 int64_t get_cgroup_memory_limit(
     const char *proc_cgroup_path, const char *proc_mountinfo_path)
@@ -404,6 +571,20 @@ int64_t get_cgroup_memory_limit(
   (void)proc_cgroup_path;
   (void)proc_mountinfo_path;
   return 0;
+}
+
+int64_t get_cgroup_cpu_limit(
+    const char *proc_cgroup_path, const char *proc_mountinfo_path)
+{
+  (void)proc_cgroup_path;
+  (void)proc_mountinfo_path;
+  return 0;
+}
+
+int64_t get_available_cpu_num()
+{
+  const int64_t cpu_num = get_cpu_num();
+  return cpu_num > 0 ? cpu_num : 1;
 }
 #endif
 

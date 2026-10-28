@@ -78,7 +78,8 @@ ObDASDomainIdMergeIter::ObDASDomainIdMergeIter()
     data_table_rtdef_(nullptr),
     rowkey_domain_tablet_ids_(),
     merge_memctx_(),
-    is_need_multi_get_(false)
+    is_need_multi_get_(false),
+    lookup_sampled_rows_(false)
 {}
 
 ObDASDomainIdMergeIter::~ObDASDomainIdMergeIter()
@@ -248,6 +249,7 @@ int ObDASDomainIdMergeIter::inner_release()
   data_table_iter_ = nullptr;
   need_filter_rowkey_domain_ = true;
   is_no_sample_ = true;
+  lookup_sampled_rows_ = false;
   return ret;
 }
 
@@ -272,7 +274,7 @@ int ObDASDomainIdMergeIter::inner_get_next_row()
   int ret = OB_SUCCESS;
   if (OB_ISNULL(data_table_iter_)) {
     ret = OB_ERR_UNEXPECTED;
-  } else if (is_need_multi_get_) {
+  } else if (is_need_multi_get_ || lookup_sampled_rows_) {
     if (OB_FAIL(multi_get_row())) {
       if (ret != OB_ITER_END) {
       }
@@ -294,7 +296,7 @@ int ObDASDomainIdMergeIter::inner_get_next_rows(int64_t &count, int64_t capacity
   int ret = OB_SUCCESS;
   if (OB_ISNULL(data_table_iter_)) {
     ret = OB_ERR_UNEXPECTED;
-  } else if (is_need_multi_get_) {
+  } else if (is_need_multi_get_ || lookup_sampled_rows_) {
     if (OB_FAIL(multi_get_rows(count, capacity))) {
     }
   } else if (!need_filter_rowkey_domain_) {
@@ -333,6 +335,11 @@ int ObDASDomainIdMergeIter::build_rowkey_domain_range()
     ret = OB_ERR_UNEXPECTED;
   } else if (OB_FAIL(check_is_need_multi_get())) {
   } else {
+    // A sampled data table scan (e.g. the sampling pass that cuts the PX ranges of a domain index
+    // build) cannot be merged row by row with a rowkey->domain table sampled on its own, so the
+    // domain ids of the sampled rows are fetched by point gets instead.  Leaving them empty made
+    // every range cut of an index keyed by the domain id degenerate.  作者：FDE WorkMate
+    lookup_sampled_rows_ = !data_table_iter_->get_scan_param().sample_info_.is_no_sample();
     const common::ObIArray<common::ObNewRange> &key_ranges = data_table_iter_->get_scan_param().key_ranges_;
     for (int64_t k = 0; OB_SUCC(ret) && k < rowkey_domain_scan_params_.count(); k++) {
       bool is_emb_vec = rowkey_domain_ctdefs_.at(k)->semantic_index_info_.is_emb_vec_tbl_;
@@ -341,7 +348,7 @@ int ObDASDomainIdMergeIter::build_rowkey_domain_range()
         ret = OB_ERR_UNEXPECTED;
       } else {
         storage::ObTableScanParam& scan_param = *rowkey_domain_scan_params_.at(k);
-        if (!is_need_multi_get_) {
+        if (!is_need_multi_get_ && !lookup_sampled_rows_) {
           for (int64_t i = 0; OB_SUCC(ret) && i < key_ranges.count(); ++i) {
             ObNewRange key_range = key_ranges.at(i);
             key_range.table_id_ = scan_param.index_id_;
@@ -400,7 +407,11 @@ int ObDASDomainIdMergeIter::build_rowkey_domain_range()
         }
         if (OB_SUCC(ret)) {
           scan_param.tablet_id_ = rowkey_domain_tablet_ids_.at(k);
-          scan_param.sample_info_ = data_table_iter_->get_scan_param().sample_info_;
+          if (lookup_sampled_rows_) {
+            scan_param.sample_info_.reset();
+          } else {
+            scan_param.sample_info_ = data_table_iter_->get_scan_param().sample_info_;
+          }
           scan_param.scan_flag_.scan_order_ = data_table_iter_->get_scan_param().scan_flag_.scan_order_;
           scan_param.enable_new_false_range_ = data_table_iter_->get_scan_param().enable_new_false_range_;
           if (!data_table_iter_->get_scan_param().need_switch_param_) {
@@ -1007,7 +1018,8 @@ int ObDASDomainIdMergeIter::multi_get_row()
   if (OB_FAIL(data_table_iter_->get_next_row())) {
     if (OB_ITER_END != ret) {
     } else if (OB_ITER_END == ret) {
-      if (is_no_sample_) {
+      // point gets of sampled rows leave nothing to drain  作者：FDE WorkMate
+      if (is_no_sample_ && !lookup_sampled_rows_) {
         for (int64_t i = 0; i < rowkey_domain_iters_.count(); i++) {
           while (OB_SUCC(rowkey_domain_iters_.at(i)->get_next_row()))
           {
@@ -1052,7 +1064,8 @@ int ObDASDomainIdMergeIter::multi_get_row()
               } else {
                 bool is_emb_vec_domain = false;
                 if (OB_FAIL(check_is_emb_vec_domain(i, is_emb_vec_domain))) {
-                } else if (is_emb_vec_domain) {
+                } else if (is_emb_vec_domain || lookup_sampled_rows_) {
+                  // a sampled row without domain id only weakens the range estimate  作者：FDE WorkMate
                   if (OB_FAIL(fill_null_domain_id_in_data_table(rowkey_domain_ctdefs_.at(i), rowkey_domain_rtdefs_.at(i), allocator))) {
                   }
                 } else {
@@ -1158,6 +1171,18 @@ int ObDASDomainIdMergeIter::multi_get_rows(int64_t &count, int64_t capacity)
                 if (OB_FAIL(get_domain_id_count(rowkey_domain_ctdefs_.at(i), domain_id_count))) {
                 } else if (OB_FAIL(empty_domain_id.push_back(ObString()))) {
                 } else if (OB_FAIL(domain_ids.push_back(empty_domain_id))) {
+                }
+              } else if (lookup_sampled_rows_) {
+                // a sampled row without domain id only weakens the range estimate  作者：FDE WorkMate
+                share::ObDomainIdUtils::DomainIds empty_domain_id;
+                int64_t domain_id_count = 0;
+                if (OB_FAIL(get_domain_id_count(rowkey_domain_ctdefs_.at(i), domain_id_count))) {
+                }
+                for (int64_t k = 0; OB_SUCC(ret) && k < domain_id_count; ++k) {
+                  if (OB_FAIL(empty_domain_id.push_back(ObString()))) {
+                  }
+                }
+                if (OB_SUCC(ret) && OB_FAIL(domain_ids.push_back(empty_domain_id))) {
                 }
               } else {
                 ret = OB_ERR_UNEXPECTED;
@@ -1311,14 +1336,19 @@ int ObDASDomainIdMergeIter::reset_rowkey_domain_iter_scan_range(int64_t iter_idx
     }
     if (OB_SUCC(ret)) {
       scan_param.tablet_id_ = rowkey_domain_tablet_ids_.at(iter_idx);
-      scan_param.sample_info_ = data_table_iter_->get_scan_param().sample_info_;
+      if (lookup_sampled_rows_) {
+        scan_param.sample_info_.reset();
+      } else {
+        scan_param.sample_info_ = data_table_iter_->get_scan_param().sample_info_;
+      }
       scan_param.scan_flag_.scan_order_ = data_table_iter_->get_scan_param().scan_flag_.scan_order_;
       if (!data_table_iter_->get_scan_param().need_switch_param_) {
         scan_param.need_switch_param_ = false;
       }
       if (OB_FAIL(iter->rescan())) {
       }
-      LOG_INFO("reset domain iter scan range", K(ret), K(iter_idx), K(is_emb_vec_domain), 
+      // per looked-up row  作者：FDE WorkMate
+      LOG_TRACE("reset domain iter scan range", K(ret), K(iter_idx), K(is_emb_vec_domain), 
                 K(scan_param.key_ranges_), K(data_table_rowkey));
     }
   }

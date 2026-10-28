@@ -176,6 +176,9 @@ private:
   ObArray<ObTabletID> rowkey_domain_tablet_ids_;
   lib::MemoryContext merge_memctx_;
   bool is_need_multi_get_;
+  // The data table scan is sampled: the domain ids of the sampled rows are fetched by point gets on
+  // the unsampled rowkey->domain table.  作者：FDE WorkMate
+  bool lookup_sampled_rows_;
 };
 
 } // end namespace sql

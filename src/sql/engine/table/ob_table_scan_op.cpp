@@ -2967,7 +2967,11 @@ int ObTableScanOp::inner_get_next_row()
       if (ret != OB_ITER_END) {
       }
     }
-  } else if (OB_UNLIKELY(MY_SPEC.is_fts_ddl_ && nullptr == tsc_rtdef_.scan_rtdef_.sample_info_)) {
+  } else if (OB_UNLIKELY(MY_SPEC.is_fts_ddl_)) {
+    // The sample pass that cuts the PX ranges of the build must see the same rows as the build
+    // itself, i.e. tokenized (word, doc id, ...) index rows.  Untokenized source rows carry no
+    // word or doc id values, so every cut fell below all real keys and one PX worker received
+    // the whole inverted table.  作者：FDE WorkMate
     if (OB_FAIL(inner_get_next_fts_index_row())) {
       if (OB_ITER_END != ret) {
       }

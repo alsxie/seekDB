@@ -23,6 +23,7 @@
 #include "data_plane/fts/dict/ob_dic_lock_service.h"
 #include "share/ob_server_struct.h"
 #include "lib/utility/utility.h"
+#include "lib/utility/ob_cpu_limit.h"
 #include "data_plane/fts/ob_fts_parser_helper.h"
 #include "share/schema/ob_multi_version_schema_service.h"
 #include "share/schema/ob_schema_utils.h"
@@ -1034,15 +1035,23 @@ int ObFtsIndexBuilderUtil::generate_doc_id_column(
 
 // Building the inverted tables (word-doc and doc-word) tokenizes, sorts and writes every word of
 // every document, which is CPU bound.  Without an explicit degree the task degree is 1 and a single
-// PX worker does all of it, so a small cpu-bounded degree is used for these two tables only.  The
-// doc id tables keep the task degree: doc ids are generated while they are built and a parallel
-// build hands them out in a run-dependent order, which would make the order of equally relevant
-// documents differ between otherwise identical builds.  作者：FDE WorkMate
+// PX worker does all of it, so a small cpu-bounded degree is used for these two tables only.  Both
+// tables are built at the same time and each gets half of the CPUs the server can actually use:
+// in a container that is the CPU quota, not the CPU count of the host, and more workers than CPUs
+// only add switching and cache misses to the same amount of work.  The doc id tables keep the task
+// degree: doc ids are generated while they are built and a parallel build hands them out in a
+// run-dependent order, which would make the order of equally relevant documents differ between
+// otherwise identical builds.  作者：FDE WorkMate
 int64_t ObFtsIndexBuilderUtil::decide_inverted_build_parallelism(const int64_t task_parallelism)
 {
-  return task_parallelism > 1
-      ? task_parallelism
-      : MIN(FTS_AUTO_MAX_PARALLELISM, MAX(1L, static_cast<int64_t>(common::get_cpu_num()) / 2));
+  int64_t parallelism = task_parallelism;
+  if (task_parallelism <= 1) {
+    const int64_t available_cpu_num = common::get_available_cpu_num();
+    parallelism = MIN(FTS_AUTO_MAX_PARALLELISM, MAX(1L, available_cpu_num / 2));
+    LOG_INFO("decide inverted table build parallelism", K(task_parallelism), K(available_cpu_num),
+             K(parallelism));
+  }
+  return parallelism;
 }
 
 int ObFtsIndexBuilderUtil::decide_parallelism(
