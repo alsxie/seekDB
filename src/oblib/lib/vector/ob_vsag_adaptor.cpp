@@ -19,6 +19,7 @@
 #include "ob_vsag_adaptor.h"
 #include <map>
 #include <set>
+#include <atomic>
 #include <mutex>
 #include <vector>
 #include <memory>
@@ -135,11 +136,35 @@ static std::shared_ptr<void> ob_cuvs_wrap(void *handle) {
   if (handle == nullptr) { return std::shared_ptr<void>(); }
   return std::shared_ptr<void>(handle, [](void *h) { seekdb_cuvs_free(h); });
 }
+// [hipVS/cuVS] State of the one-off asynchronous GPU warm-up (ob_cuvs_warmup_async).
+enum ObCuvsWarmupState {
+  OB_CUVS_WARMUP_IDLE = 0,
+  OB_CUVS_WARMUP_RUNNING = 1,
+  OB_CUVS_WARMUP_DONE = 2,
+  OB_CUVS_WARMUP_FAILED = 3,
+  OB_CUVS_WARMUP_SKIPPED = 4
+};
+static std::atomic<int> g_ob_cuvs_warmup_state(OB_CUVS_WARMUP_IDLE);
+static std::atomic<int64_t> g_ob_cuvs_warmup_us(0);
+// Real GPU work never runs concurrently with the warm-up: every bridge job first
+// waits (bounded) for an in-flight warm-up. The warm-up only overlaps CPU-side
+// work such as the DDL table scan; at worst it delays a GPU call by its own tiny
+// build, while the one-off GPU start-up cost it absorbs is paid only once.
+static const int64_t OB_CUVS_WARMUP_WAIT_MAX_US = 120L * 1000 * 1000;
+static void ob_cuvs_wait_warmup() {
+  if (g_ob_cuvs_warmup_state.load() != OB_CUVS_WARMUP_RUNNING) { return; }
+  const int64_t deadline_us = ObTimeUtility::current_time() + OB_CUVS_WARMUP_WAIT_MAX_US;
+  while (g_ob_cuvs_warmup_state.load() == OB_CUVS_WARMUP_RUNNING &&
+         ObTimeUtility::current_time() < deadline_us) {
+    ::usleep(1000);
+  }
+}
 struct ObCuvsBuildJob {
   const float *base; long n; long dim; void *out;
 };
 static void *ob_cuvs_build_job(void *arg) {
   ObCuvsBuildJob *j = static_cast<ObCuvsBuildJob *>(arg);
+  ob_cuvs_wait_warmup();
   j->out = seekdb_cuvs_build(j->base, j->n, j->dim);
   return nullptr;
 }
@@ -152,6 +177,64 @@ static std::shared_ptr<void> ob_cuvs_build_big_stack(const float *base, long n, 
   pthread_attr_destroy(&attr);
   return ob_cuvs_wrap(job.out);
 }
+
+// [hipVS/cuVS] Asynchronous GPU warm-up, once per process.
+// The first CAGRA build in a fresh observer also pays for HIP runtime start-up
+// and for lazily loading the hipVS kernels it needs (NN-Descent, graph
+// optimisation, search). As soon as the first lib=cuvs vectors are ingested, a
+// tiny CAGRA kNN on synthetic data runs on a detached 32MB-stack thread, so this
+// fixed cost overlaps the DDL table scan instead of sitting on the critical path
+// of the snapshot build. It only calls the existing bridge ABI, touches no index
+// state and ignores failures (e.g. no visible GPU). OB_CUVS_WARMUP=0 disables it.
+static const long OB_CUVS_WARMUP_ROWS = 2048;
+static const int OB_CUVS_WARMUP_MAX_DIM = 4096;
+static void *ob_cuvs_warmup_job(void *arg) {
+  const long dim = static_cast<long>(reinterpret_cast<intptr_t>(arg));
+  const int64_t start_us = ObTimeUtility::current_time();
+  int state = OB_CUVS_WARMUP_FAILED;
+  try {
+    std::vector<float> base(static_cast<size_t>(OB_CUVS_WARMUP_ROWS) * static_cast<size_t>(dim));
+    uint32_t seed = 0x9E3779B9U;
+    for (size_t i = 0; i < base.size(); ++i) {
+      seed = seed * 1664525U + 1013904223U;
+      base[i] = static_cast<float>(seed >> 8) * (1.0f / 16777216.0f) - 0.5f;
+    }
+    unsigned int ids[10] = {0};
+    if (seekdb_cuvs_cagra_knn(base.data(), OB_CUVS_WARMUP_ROWS, dim, base.data(), 1, 10, ids) == 0) {
+      state = OB_CUVS_WARMUP_DONE;
+    }
+  } catch (...) {
+    state = OB_CUVS_WARMUP_FAILED;
+  }
+  g_ob_cuvs_warmup_us.store(ObTimeUtility::current_time() - start_us);
+  g_ob_cuvs_warmup_state.store(state);
+  return nullptr;
+}
+static void ob_cuvs_warmup_async(int dim) {
+  if (g_ob_cuvs_warmup_state.load(std::memory_order_relaxed) != OB_CUVS_WARMUP_IDLE) { return; }
+  int expected = OB_CUVS_WARMUP_IDLE;
+  if (!g_ob_cuvs_warmup_state.compare_exchange_strong(expected, OB_CUVS_WARMUP_RUNNING)) { return; }
+  const char *env = ::getenv("OB_CUVS_WARMUP");
+  if ((env != nullptr && env[0] == '0') || dim <= 0 || dim > OB_CUVS_WARMUP_MAX_DIM) {
+    g_ob_cuvs_warmup_state.store(OB_CUVS_WARMUP_SKIPPED);
+    return;
+  }
+  bool started = false;
+  pthread_t tid;
+  pthread_attr_t attr;
+  if (pthread_attr_init(&attr) == 0) {
+    if (pthread_attr_setstacksize(&attr, 32UL * 1024 * 1024) == 0 &&
+        pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED) == 0 &&
+        pthread_create(&tid, &attr, ob_cuvs_warmup_job,
+                       reinterpret_cast<void *>(static_cast<intptr_t>(dim))) == 0) {
+      started = true;
+    }
+    pthread_attr_destroy(&attr);
+  }
+  if (!started) { g_ob_cuvs_warmup_state.store(OB_CUVS_WARMUP_FAILED); }
+  LOG_INFO("[OBVSAG][cuVS] asynchronous GPU warm-up", K(started), K(dim));
+}
+
 static void ob_cuvs_register(void *key, const float *vectors, const int64_t *ids,
                              int dim, int size) {
   ObCuvsEntry *ent = new ObCuvsEntry();
@@ -171,6 +254,7 @@ static void ob_cuvs_register(void *key, const float *vectors, const int64_t *ids
 static void ob_cuvs_add(void *key, const float *vectors, const int64_t *ids,
                         int dim, int size) {
   if (vectors == nullptr || ids == nullptr || dim <= 0 || size <= 0) { return; }
+  ob_cuvs_warmup_async(dim);
   std::lock_guard<std::mutex> guard(g_ob_cuvs_mu);
   ObCuvsEntry *&slot = g_ob_cuvs_reg[key];
   if (slot == nullptr) { slot = new ObCuvsEntry(); slot->dim_ = dim; }
@@ -202,6 +286,7 @@ struct ObCuvsJob {
 // small (~1.5MB) OB worker-thread stack.
 static void *ob_cuvs_job(void *arg) {
   ObCuvsJob *j = static_cast<ObCuvsJob *>(arg);
+  ob_cuvs_wait_warmup();
   if (j->need_build) {
     void *nb = seekdb_cuvs_build(j->ent->buf_vecs_.data(), static_cast<long>(j->n),
                                  static_cast<long>(j->dim));
@@ -229,6 +314,7 @@ struct ObCuvsBatchJob {
 };
 static void *ob_cuvs_batch_job(void *arg) {
   ObCuvsBatchJob *j = static_cast<ObCuvsBatchJob *>(arg);
+  ob_cuvs_wait_warmup();
   if (j->need_build) {
     void *nb = seekdb_cuvs_build(j->ent->buf_vecs_.data(), static_cast<long>(j->n),
                                  static_cast<long>(j->ent->dim_));
@@ -253,6 +339,7 @@ struct ObCuvsRawBatchJob {
 };
 static void *ob_cuvs_raw_batch_job(void *arg) {
   ObCuvsRawBatchJob *j = static_cast<ObCuvsRawBatchJob *>(arg);
+  ob_cuvs_wait_warmup();
   void *h = seekdb_cuvs_build(j->base, j->n, j->dim);
   if (h != nullptr) {
     if (seekdb_cuvs_search(h, j->query, j->nq, j->topk, j->off, j->dst) == 0) {
@@ -320,7 +407,14 @@ static bool ob_cuvs_try_search(void *key, vsag::Allocator *alloc,
   return true;
 }
 
-static const char OB_CUVS_SNAPSHOT_MAGIC[8] = {'O', 'B', 'C', 'U', 'V', 'S', '0', '2'};
+// Snapshot layouts. OBCUVS03 (written):
+//   magic | dim32 | reserved32 | n64 | ids[n] i64 | vecs[n*dim] f32 | graph_bytes u64 | graph
+// OBCUVS02 (read for compatibility):
+//   magic | graph_bytes u64 | dim32 | reserved32 | n64 | ids | vecs | graph
+static const char OB_CUVS_SNAPSHOT_MAGIC_V2[8] = {'O', 'B', 'C', 'U', 'V', 'S', '0', '2'};
+static const char OB_CUVS_SNAPSHOT_MAGIC_V3[8] = {'O', 'B', 'C', 'U', 'V', 'S', '0', '3'};
+// Staging chunk for copying the CAGRA graph file to/from the snapshot stream.
+static const size_t OB_CUVS_STAGE_CHUNK = 4UL * 1024 * 1024;
 struct ObCuvsSnapshotFile {
   FILE *file_ = ::tmpfile();
   char path_[64] = {};
@@ -338,6 +432,7 @@ struct ObCuvsSnapshotJob {
 };
 static void *ob_cuvs_snapshot_job(void *arg) {
   ObCuvsSnapshotJob *job = static_cast<ObCuvsSnapshotJob *>(arg);
+  ob_cuvs_wait_warmup();
   if (job->load_) {
     job->handle_ = seekdb_cuvs_deserialize(job->path_, job->n_, job->dim_);
     job->rc_ = job->handle_ == nullptr ? -1 : 0;
@@ -379,7 +474,60 @@ static bool ob_cuvs_read(std::istream &in, void *data, size_t bytes) {
   return true;
 }
 
+// GPU half of a pipelined snapshot: (re)build CAGRA when the cached GPU index is
+// stale, then write its graph file. Runs on a 32MB-stack pthread (cuVS overflows
+// the OB worker stack) while the caller streams ids/vectors into the snapshot.
+// The job never touches the registry entry; the caller adopts built_ after join.
+struct ObCuvsPersistJob {
+  const float *base_; long n_; long dim_;
+  void *handle_;      // up-to-date handle to serialize when need_build_ is false
+  bool need_build_;
+  const char *path_;
+  void *built_;       // out: handle built by this job, owned by the caller
+  int rc_;            // out: 0 when the graph file was written
+  int64_t gpu_us_;    // out: wall time of build + graph serialization
+};
+static void *ob_cuvs_persist_job(void *arg) {
+  ObCuvsPersistJob *job = static_cast<ObCuvsPersistJob *>(arg);
+  ob_cuvs_wait_warmup();
+  const int64_t start_us = ObTimeUtility::current_time();
+  void *handle = job->handle_;
+  if (job->need_build_) {
+    job->built_ = seekdb_cuvs_build(job->base_, job->n_, job->dim_);
+    handle = job->built_;
+  }
+  job->rc_ = handle == nullptr ? -1 : seekdb_cuvs_serialize(handle, job->path_);
+  job->gpu_us_ = ObTimeUtility::current_time() - start_us;
+  return nullptr;
+}
+// Joins a started big-stack pthread on every exit path.
+struct ObCuvsThreadJoiner {
+  pthread_t tid_;
+  bool active_ = false;
+  ObCuvsThreadJoiner() : tid_() {}
+  ~ObCuvsThreadJoiner() { join(); }
+  void join() { if (active_) { pthread_join(tid_, nullptr); active_ = false; } }
+  ObCuvsThreadJoiner(const ObCuvsThreadJoiner &) = delete;
+  ObCuvsThreadJoiner &operator=(const ObCuvsThreadJoiner &) = delete;
+};
+static bool ob_cuvs_start_big_stack(ObCuvsThreadJoiner &joiner, void *(*fn)(void *), void *arg) {
+  pthread_attr_t attr;
+  if (pthread_attr_init(&attr) != 0) { return false; }
+  int rc = pthread_attr_setstacksize(&attr, 32UL * 1024 * 1024);
+  if (rc == 0) { rc = pthread_create(&joiner.tid_, &attr, fn, arg); }
+  pthread_attr_destroy(&attr);
+  joiner.active_ = (rc == 0);
+  return joiner.active_;
+}
+static inline bool ob_cuvs_graph_bytes_valid(uint64_t graph_bytes) {
+  return graph_bytes > 0 && graph_bytes <= static_cast<uint64_t>(INT64_MAX);
+}
+
 // Returns false when the index is not a GPU candidate and must use the VSAG format.
+// Writes the OBCUVS03 layout. The ids/vectors section does not depend on the GPU,
+// so it is streamed into the snapshot (synchronous LOB appends in the DDL) while
+// the GPU builds and serializes the CAGRA graph; the graph section follows once
+// the GPU job has finished. The GPU calls and their parameters are unchanged.
 static bool ob_cuvs_serialize(void *key, std::ostream &out, int &ret) {
   ret = OB_SUCCESS;
   std::lock_guard<std::mutex> guard(g_ob_cuvs_mu);
@@ -392,44 +540,60 @@ static bool ob_cuvs_serialize(void *key, std::ostream &out, int &ret) {
     return false;
   }
   const int64_t start_us = ObTimeUtility::current_time();
+  const bool need_build = ent->bridge_ == nullptr || ent->built_n_ != n;
+  ObCuvsSnapshotFile graph;
+  ObCuvsPersistJob job{ent->buf_vecs_.data(), static_cast<long>(n), static_cast<long>(ent->dim_),
+                       need_build ? nullptr : ent->bridge_.get(), need_build, graph.path_,
+                       nullptr, -1, 0};
+  ObCuvsThreadJoiner gpu_job;
+  if (graph.file_ == nullptr || !ob_cuvs_start_big_stack(gpu_job, ob_cuvs_persist_job, &job)) {
+    ret = OB_ERR_VSAG_RETURN_ERROR;
+    LOG_WARN("[OBVSAG][cuVS] failed to start GPU CAGRA snapshot job", K(ret), KP(key), K(n));
+    return true;
+  }
+  const int32_t dim32 = ent->dim_;
+  const int32_t reserved = 0;
+  const int64_t n64 = static_cast<int64_t>(n);
+  const bool stream_ok =
+      ob_cuvs_write(out, OB_CUVS_SNAPSHOT_MAGIC_V3, sizeof(OB_CUVS_SNAPSHOT_MAGIC_V3)) &&
+      ob_cuvs_write(out, &dim32, sizeof(dim32)) &&
+      ob_cuvs_write(out, &reserved, sizeof(reserved)) &&
+      ob_cuvs_write(out, &n64, sizeof(n64)) &&
+      ob_cuvs_write(out, ent->buf_ids_.data(), n * sizeof(int64_t)) &&
+      ob_cuvs_write(out, ent->buf_vecs_.data(), ent->buf_vecs_.size() * sizeof(float));
+  const int64_t stream_us = ObTimeUtility::current_time() - start_us;
+  gpu_job.join();
+  const int64_t build_us = ObTimeUtility::current_time() - start_us;
+  const int64_t gpu_us = job.gpu_us_;
   bool built = false;
-  if (ent->bridge_ == nullptr || ent->built_n_ != n) {
-    std::shared_ptr<void> nb = ob_cuvs_build_big_stack(ent->buf_vecs_.data(),
-                                                       static_cast<long>(n), ent->dim_);
-    if (nb == nullptr) {
+  if (need_build) {
+    if (job.built_ == nullptr) {
       ret = OB_ERR_VSAG_RETURN_ERROR;
       LOG_WARN("[OBVSAG][cuVS] GPU CAGRA build failed during snapshot serialize",
                K(ret), KP(key), K(n), K(ent->dim_));
       return true;
     }
-    ent->bridge_ = nb; ent->built_n_ = n; ent->ids_ = ent->buf_ids_;
+    ent->bridge_ = ob_cuvs_wrap(job.built_); ent->built_n_ = n; ent->ids_ = ent->buf_ids_;
     built = true;
   }
-  ObCuvsSnapshotFile graph;
-  ObCuvsSnapshotJob job{graph.path_, ent->bridge_.get(), static_cast<long>(n), ent->dim_, false, -1};
-  if (graph.file_ == nullptr || !ob_cuvs_snapshot_big_stack(job) ||
-      ::fseeko(graph.file_, 0, SEEK_END) != 0 || ::ftello(graph.file_) <= 0) {
-    ret = OB_ERR_VSAG_RETURN_ERROR;
-    return true;
-  }
-  const uint64_t graph_bytes = static_cast<uint64_t>(::ftello(graph.file_));
-  ::rewind(graph.file_);
-  const int64_t build_us = ObTimeUtility::current_time() - start_us;
-  const int32_t dim32 = ent->dim_;
-  const int32_t reserved = 0;
-  const int64_t n64 = static_cast<int64_t>(n);
-  if (!ob_cuvs_write(out, OB_CUVS_SNAPSHOT_MAGIC, sizeof(OB_CUVS_SNAPSHOT_MAGIC)) ||
-      !ob_cuvs_write(out, &graph_bytes, sizeof(graph_bytes)) ||
-      !ob_cuvs_write(out, &dim32, sizeof(dim32)) ||
-      !ob_cuvs_write(out, &reserved, sizeof(reserved)) ||
-      !ob_cuvs_write(out, &n64, sizeof(n64)) ||
-      !ob_cuvs_write(out, ent->buf_ids_.data(), n * sizeof(int64_t)) ||
-      !ob_cuvs_write(out, ent->buf_vecs_.data(), ent->buf_vecs_.size() * sizeof(float))) {
+  if (!stream_ok) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("[OBVSAG][cuVS] failed to write snapshot stream", K(ret), KP(key), K(n));
     return true;
   }
-  std::vector<char> chunk(65536);
+  if (job.rc_ != 0 || ::fseeko(graph.file_, 0, SEEK_END) != 0 || ::ftello(graph.file_) <= 0) {
+    ret = OB_ERR_VSAG_RETURN_ERROR;
+    LOG_WARN("[OBVSAG][cuVS] failed to serialize GPU CAGRA graph", K(ret), KP(key), K(n), K(job.rc_));
+    return true;
+  }
+  const uint64_t graph_bytes = static_cast<uint64_t>(::ftello(graph.file_));
+  ::rewind(graph.file_);
+  if (!ob_cuvs_write(out, &graph_bytes, sizeof(graph_bytes))) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("[OBVSAG][cuVS] failed to write snapshot stream", K(ret), KP(key), K(n));
+    return true;
+  }
+  std::vector<char> chunk(OB_CUVS_STAGE_CHUNK);
   uint64_t remaining = graph_bytes;
   while (remaining > 0) {
     const size_t bytes = std::min<uint64_t>(remaining, chunk.size());
@@ -439,26 +603,35 @@ static bool ob_cuvs_serialize(void *key, std::ostream &out, int &ret) {
     }
     remaining -= bytes;
   }
+  const int warmup_state = g_ob_cuvs_warmup_state.load();
+  const int64_t warmup_us = g_ob_cuvs_warmup_us.load();
   LOG_INFO("[OBVSAG][cuVS] serialized GPU CAGRA snapshot", KP(key), K(n), K(dim32),
-           K(built), K(build_us), K(graph_bytes));
+           K(built), K(build_us), K(graph_bytes), K(gpu_us), K(stream_us),
+           K(warmup_state), K(warmup_us));
   return true;
 }
 
 // Consumes the stream after the magic. Registers and marks the handle for GPU search.
-static int ob_cuvs_deserialize(void *key, int expected_dim, std::istream &in) {
+// OBCUVS02 stores graph_bytes before dim/n; OBCUVS03 stores it after the vectors.
+static int ob_cuvs_deserialize(void *key, int expected_dim, std::istream &in,
+                               const bool graph_bytes_trails) {
   int ret = OB_SUCCESS;
   uint64_t graph_bytes = 0;
   int32_t dim32 = 0;
   int32_t reserved = 0;
   int64_t n64 = 0;
-  if (!ob_cuvs_read(in, &graph_bytes, sizeof(graph_bytes)) || !ob_cuvs_read(in, &dim32, sizeof(dim32)) ||
-      !ob_cuvs_read(in, &reserved, sizeof(reserved)) || !ob_cuvs_read(in, &n64, sizeof(n64))) {
+  const bool header_ok =
+      (graph_bytes_trails || ob_cuvs_read(in, &graph_bytes, sizeof(graph_bytes))) &&
+      ob_cuvs_read(in, &dim32, sizeof(dim32)) &&
+      ob_cuvs_read(in, &reserved, sizeof(reserved)) &&
+      ob_cuvs_read(in, &n64, sizeof(n64));
+  if (!header_ok) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("[OBVSAG][cuVS] truncated snapshot header", K(ret), KP(key));
   } else if (dim32 <= 0 || dim32 != expected_dim || reserved != 0 || n64 <= 0 ||
              n64 > UINT32_MAX ||
              static_cast<uint64_t>(n64) > std::numeric_limits<size_t>::max() / sizeof(float) / dim32 ||
-             graph_bytes == 0 || graph_bytes > static_cast<uint64_t>(INT64_MAX)) {
+             (!graph_bytes_trails && !ob_cuvs_graph_bytes_valid(graph_bytes))) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("[OBVSAG][cuVS] invalid snapshot header", K(ret), KP(key), K(dim32),
              K(expected_dim), K(n64));
@@ -473,9 +646,15 @@ static int ob_cuvs_deserialize(void *key, int expected_dim, std::istream &in) {
       delete ent;
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("[OBVSAG][cuVS] truncated snapshot payload", K(ret), KP(key), K(n64));
+    } else if (graph_bytes_trails &&
+               (!ob_cuvs_read(in, &graph_bytes, sizeof(graph_bytes)) ||
+                !ob_cuvs_graph_bytes_valid(graph_bytes))) {
+      delete ent;
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("[OBVSAG][cuVS] invalid snapshot graph length", K(ret), KP(key), K(n64), K(graph_bytes));
     } else {
       ObCuvsSnapshotFile graph;
-      std::vector<char> chunk(65536);
+      std::vector<char> chunk(OB_CUVS_STAGE_CHUNK);
       uint64_t remaining = graph_bytes;
       while (graph.file_ != nullptr && remaining > 0) {
         const size_t bytes = std::min<uint64_t>(remaining, chunk.size());
@@ -506,7 +685,7 @@ static int ob_cuvs_deserialize(void *key, int expected_dim, std::istream &in) {
         g_ob_cuvs_marked.insert(key);
       }
       LOG_INFO("[OBVSAG][cuVS] deserialized GPU CAGRA snapshot", KP(key), K(n64), K(dim32),
-               K(graph_bytes));
+               K(graph_bytes), K(graph_bytes_trails));
     }
   }
   return ret;
@@ -1936,13 +2115,16 @@ int fdeserialize(VectorIndexPtr &index_handler,
     if (((IndexType)index_type == IndexType::HNSW_TYPE ||
          (IndexType)index_type == IndexType::HGRAPH_TYPE) &&
         in_stream.rdbuf() != nullptr &&
-        in_stream.rdbuf()->in_avail() >= static_cast<std::streamsize>(sizeof(OB_CUVS_SNAPSHOT_MAGIC))) {
-      char magic[sizeof(OB_CUVS_SNAPSHOT_MAGIC)] = {0};
+        in_stream.rdbuf()->in_avail() >= static_cast<std::streamsize>(sizeof(OB_CUVS_SNAPSHOT_MAGIC_V3))) {
+      char magic[sizeof(OB_CUVS_SNAPSHOT_MAGIC_V3)] = {0};
       std::streambuf *sb = in_stream.rdbuf();
       const std::streamsize got = sb->sgetn(magic, sizeof(magic));
-      if (got == static_cast<std::streamsize>(sizeof(magic)) &&
-          0 == memcmp(magic, OB_CUVS_SNAPSHOT_MAGIC, sizeof(magic))) {
-        return ob_cuvs_deserialize(index_handler, dim, in_stream);
+      if (got == static_cast<std::streamsize>(sizeof(magic))) {
+        if (0 == memcmp(magic, OB_CUVS_SNAPSHOT_MAGIC_V3, sizeof(magic))) {
+          return ob_cuvs_deserialize(index_handler, dim, in_stream, true /*graph_bytes_trails*/);
+        } else if (0 == memcmp(magic, OB_CUVS_SNAPSHOT_MAGIC_V2, sizeof(magic))) {
+          return ob_cuvs_deserialize(index_handler, dim, in_stream, false /*graph_bytes_trails*/);
+        }
       }
       if (sb->pubseekoff(-got, std::ios_base::cur, std::ios_base::in) == std::streampos(-1)) {
         ret = OB_ERR_UNEXPECTED;
