@@ -24,7 +24,8 @@ V5, so recall is unchanged.
    section follows after the join. The snapshot format becomes `OBCUVS03`
    (graph length moved behind the vectors); `OBCUVS02` snapshots still load.
 2. Asynchronous GPU warm-up. The first `lib=cuvs` rows ingested by the process
-   start a one-off CAGRA kNN on 2048 synthetic rows on a detached thread, so
+   build a CAGRA index on 2048 synthetic rows and run one search on a detached
+   thread (bridge build/search/free only), so
    HIP runtime start-up and hipVS kernel loading overlap the DDL table scan
    instead of delaying the first real build. GPU builds, searches and snapshot
    load/store wait for an in-flight warm-up, so they never overlap it. Failures
@@ -43,6 +44,9 @@ No AMD GPU was available for this change. It was validated with a CPU mock of
 `libseekdb_cuvs_bridge.so` (same C ABI, exact brute-force search, configurable
 latency):
 
+- The observer references exactly the same bridge symbols as V5 (`nm -D`).
+  It is linked BIND_NOW, so an extra symbol would stop start-up on a bridge
+  that does not export it.
 - Release build with `-DOB_BUILD_CUVS=ON -DOB_BUILD_CUVS_TRACE=ON` (`-Werror`)
   succeeds; the adaptor also compiles with cuVS off and with the tracer off.
 - `run_ddl_persistence_smoke.sh` and `run_gpu_smoke.sh` pass, as they do for V5

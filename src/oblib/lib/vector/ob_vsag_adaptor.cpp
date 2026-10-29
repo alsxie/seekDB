@@ -199,9 +199,16 @@ static void *ob_cuvs_warmup_job(void *arg) {
       seed = seed * 1664525U + 1013904223U;
       base[i] = static_cast<float>(seed >> 8) * (1.0f / 16777216.0f) - 0.5f;
     }
-    unsigned int ids[10] = {0};
-    if (seekdb_cuvs_cagra_knn(base.data(), OB_CUVS_WARMUP_ROWS, dim, base.data(), 1, 10, ids) == 0) {
-      state = OB_CUVS_WARMUP_DONE;
+    // Only bridge entry points V5 already links (build/search/free): the observer
+    // is linked BIND_NOW, so every referenced bridge symbol must resolve at start-up.
+    void *h = seekdb_cuvs_build(base.data(), OB_CUVS_WARMUP_ROWS, dim);
+    if (h != nullptr) {
+      unsigned int ids[10] = {0};
+      float dists[10] = {0};
+      if (seekdb_cuvs_search(h, base.data(), 1, 10, ids, dists) == 0) {
+        state = OB_CUVS_WARMUP_DONE;
+      }
+      seekdb_cuvs_free(h);
     }
   } catch (...) {
     state = OB_CUVS_WARMUP_FAILED;
