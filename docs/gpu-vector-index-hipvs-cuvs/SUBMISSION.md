@@ -32,6 +32,17 @@ V5, so recall is unchanged.
    are ignored (no visible GPU); `OB_CUVS_WARMUP=0` disables it.
 3. The graph is copied between the staging file and the snapshot stream in
    4 MB chunks instead of 64 KB.
+4. Start-up with older bridge builds. The observer is linked with BIND_NOW.
+   The hipVS runtime image ships `/seekdb_workspace/bridge/libseekdb_cuvs_bridge.so`
+   (exports only `build/search/free/cagra_knn`) and puts that directory first
+   on `LD_LIBRARY_PATH` and in `ld.so.conf`, so V5 dies at start-up with
+   `undefined symbol: seekdb_cuvs_serialize`, whichever bridge it was linked
+   against. `seekdb_cuvs_serialize`, `seekdb_cuvs_deserialize` and
+   `seekdb_cuvs_cagra_knn` are now weak references. With such a bridge the
+   snapshot stores ids/vectors with `graph_bytes=0` and CAGRA is rebuilt on
+   the GPU from the vectors when the snapshot loads. With the bridge from
+   `tools/hipvs_bridge` nothing changes (`graph_io=true`, graph persisted).
+   The log lines add `graph_io` (serialize) and `load_graph` (deserialize).
 
 The `serialized GPU CAGRA snapshot` log line keeps its fields and adds
 `gpu_us` (GPU build + graph serialization), `stream_us` (ids/vectors streaming

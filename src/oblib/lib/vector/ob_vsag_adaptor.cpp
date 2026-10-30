@@ -47,15 +47,34 @@
 // [hipVS/cuVS] GPU vector-search bridge symbol, implemented in
 // libseekdb_cuvs_bridge.so (internally uses cuVS CAGRA on the GPU).
 #ifdef OB_BUILD_CUVS
+// cagra_knn/serialize/deserialize are weak: the observer is linked with BIND_NOW,
+// and older bridge builds (e.g. the one preinstalled in the hipVS runtime image
+// under /seekdb_workspace/bridge, first on LD_LIBRARY_PATH and ld.so.conf) only
+// export build/search/free. A strong reference makes such an observer die at
+// start-up with "undefined symbol: seekdb_cuvs_serialize". With weak references
+// a missing symbol resolves to NULL and the snapshot code falls back to
+// persisting ids/vectors only and rebuilding the CAGRA graph on load.
 extern "C" int   seekdb_cuvs_cagra_knn(const float *base, long n, long dim,
                                        const float *query, long nq, long topk,
-                                       unsigned int *out_ids);
+                                       unsigned int *out_ids) __attribute__((weak));
 extern "C" void *seekdb_cuvs_build(const float *base, long n, long dim);
 extern "C" int   seekdb_cuvs_search(void *handle, const float *query, long nq, long topk,
                                     unsigned int *out_ids, float *out_dist);
 extern "C" void  seekdb_cuvs_free(void *handle);
-extern "C" int seekdb_cuvs_serialize(void *handle, const char *filename);
-extern "C" void *seekdb_cuvs_deserialize(const char *filename, long n, long dim);
+extern "C" int seekdb_cuvs_serialize(void *handle, const char *filename) __attribute__((weak));
+extern "C" void *seekdb_cuvs_deserialize(const char *filename, long n, long dim) __attribute__((weak));
+// True when the loaded bridge can save/load CAGRA graph files.
+static bool ob_cuvs_has_graph_io()
+{
+  void *volatile ser = reinterpret_cast<void *>(&seekdb_cuvs_serialize);
+  void *volatile de = reinterpret_cast<void *>(&seekdb_cuvs_deserialize);
+  return ser != nullptr && de != nullptr;
+}
+static bool ob_cuvs_has_cagra_knn()
+{
+  void *volatile p = reinterpret_cast<void *>(&seekdb_cuvs_cagra_knn);
+  return p != nullptr;
+}
 #else
 // GPU backend not compiled in (OB_BUILD_CUVS=OFF): inert stubs so oblib links
 // without libseekdb_cuvs_bridge.so. ob_cuvs_enabled() is false, so these are
@@ -66,6 +85,8 @@ static int   seekdb_cuvs_search(void *, const float *, long, long, unsigned int 
 static void  seekdb_cuvs_free(void *) {}
 static int seekdb_cuvs_serialize(void *, const char *) { return -1; }
 static void *seekdb_cuvs_deserialize(const char *, long, long) { return nullptr; }
+static bool ob_cuvs_has_graph_io() { return true; }
+static bool ob_cuvs_has_cagra_knn() { return true; }
 #endif
 
 namespace oceanbase {
@@ -416,6 +437,8 @@ static bool ob_cuvs_try_search(void *key, vsag::Allocator *alloc,
 
 // Snapshot layouts. OBCUVS03 (written):
 //   magic | dim32 | reserved32 | n64 | ids[n] i64 | vecs[n*dim] f32 | graph_bytes u64 | graph
+//   graph_bytes == 0 means no graph section (bridge without serialize); the
+//   CAGRA index is then rebuilt from the vectors when the snapshot is loaded.
 // OBCUVS02 (read for compatibility):
 //   magic | graph_bytes u64 | dim32 | reserved32 | n64 | ids | vecs | graph
 static const char OB_CUVS_SNAPSHOT_MAGIC_V2[8] = {'O', 'B', 'C', 'U', 'V', 'S', '0', '2'};
@@ -440,7 +463,9 @@ struct ObCuvsSnapshotJob {
 static void *ob_cuvs_snapshot_job(void *arg) {
   ObCuvsSnapshotJob *job = static_cast<ObCuvsSnapshotJob *>(arg);
   ob_cuvs_wait_warmup();
-  if (job->load_) {
+  if (!ob_cuvs_has_graph_io()) {
+    job->rc_ = -1;
+  } else if (job->load_) {
     job->handle_ = seekdb_cuvs_deserialize(job->path_, job->n_, job->dim_);
     job->rc_ = job->handle_ == nullptr ? -1 : 0;
   } else {
@@ -491,8 +516,9 @@ struct ObCuvsPersistJob {
   bool need_build_;
   const char *path_;
   void *built_;       // out: handle built by this job, owned by the caller
-  int rc_;            // out: 0 when the graph file was written
+  int rc_;            // out: 0 when the graph file was written (or graph I/O is unavailable)
   int64_t gpu_us_;    // out: wall time of build + graph serialization
+  bool graph_io_;     // in: bridge exports serialize/deserialize
 };
 static void *ob_cuvs_persist_job(void *arg) {
   ObCuvsPersistJob *job = static_cast<ObCuvsPersistJob *>(arg);
@@ -503,7 +529,11 @@ static void *ob_cuvs_persist_job(void *arg) {
     job->built_ = seekdb_cuvs_build(job->base_, job->n_, job->dim_);
     handle = job->built_;
   }
-  job->rc_ = handle == nullptr ? -1 : seekdb_cuvs_serialize(handle, job->path_);
+  if (handle == nullptr) {
+    job->rc_ = -1;
+  } else {
+    job->rc_ = job->graph_io_ ? seekdb_cuvs_serialize(handle, job->path_) : 0;
+  }
   job->gpu_us_ = ObTimeUtility::current_time() - start_us;
   return nullptr;
 }
@@ -548,10 +578,11 @@ static bool ob_cuvs_serialize(void *key, std::ostream &out, int &ret) {
   }
   const int64_t start_us = ObTimeUtility::current_time();
   const bool need_build = ent->bridge_ == nullptr || ent->built_n_ != n;
+  const bool graph_io = ob_cuvs_has_graph_io();
   ObCuvsSnapshotFile graph;
   ObCuvsPersistJob job{ent->buf_vecs_.data(), static_cast<long>(n), static_cast<long>(ent->dim_),
                        need_build ? nullptr : ent->bridge_.get(), need_build, graph.path_,
-                       nullptr, -1, 0};
+                       nullptr, -1, 0, graph_io};
   ObCuvsThreadJoiner gpu_job;
   if (graph.file_ == nullptr || !ob_cuvs_start_big_stack(gpu_job, ob_cuvs_persist_job, &job)) {
     ret = OB_ERR_VSAG_RETURN_ERROR;
@@ -588,12 +619,12 @@ static bool ob_cuvs_serialize(void *key, std::ostream &out, int &ret) {
     LOG_WARN("[OBVSAG][cuVS] failed to write snapshot stream", K(ret), KP(key), K(n));
     return true;
   }
-  if (job.rc_ != 0 || ::fseeko(graph.file_, 0, SEEK_END) != 0 || ::ftello(graph.file_) <= 0) {
+  if (job.rc_ != 0 || (graph_io && (::fseeko(graph.file_, 0, SEEK_END) != 0 || ::ftello(graph.file_) <= 0))) {
     ret = OB_ERR_VSAG_RETURN_ERROR;
     LOG_WARN("[OBVSAG][cuVS] failed to serialize GPU CAGRA graph", K(ret), KP(key), K(n), K(job.rc_));
     return true;
   }
-  const uint64_t graph_bytes = static_cast<uint64_t>(::ftello(graph.file_));
+  const uint64_t graph_bytes = graph_io ? static_cast<uint64_t>(::ftello(graph.file_)) : 0;
   ::rewind(graph.file_);
   if (!ob_cuvs_write(out, &graph_bytes, sizeof(graph_bytes))) {
     ret = OB_ERR_UNEXPECTED;
@@ -613,7 +644,7 @@ static bool ob_cuvs_serialize(void *key, std::ostream &out, int &ret) {
   const int warmup_state = g_ob_cuvs_warmup_state.load();
   const int64_t warmup_us = g_ob_cuvs_warmup_us.load();
   LOG_INFO("[OBVSAG][cuVS] serialized GPU CAGRA snapshot", KP(key), K(n), K(dim32),
-           K(built), K(build_us), K(graph_bytes), K(gpu_us), K(stream_us),
+           K(built), K(build_us), K(graph_bytes), K(graph_io), K(gpu_us), K(stream_us),
            K(warmup_state), K(warmup_us));
   return true;
 }
@@ -655,30 +686,43 @@ static int ob_cuvs_deserialize(void *key, int expected_dim, std::istream &in,
       LOG_WARN("[OBVSAG][cuVS] truncated snapshot payload", K(ret), KP(key), K(n64));
     } else if (graph_bytes_trails &&
                (!ob_cuvs_read(in, &graph_bytes, sizeof(graph_bytes)) ||
-                !ob_cuvs_graph_bytes_valid(graph_bytes))) {
+                (graph_bytes != 0 && !ob_cuvs_graph_bytes_valid(graph_bytes)))) {
       delete ent;
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("[OBVSAG][cuVS] invalid snapshot graph length", K(ret), KP(key), K(n64), K(graph_bytes));
     } else {
+      // Load the stored graph when there is one and the bridge can read it;
+      // otherwise skip the graph bytes and rebuild CAGRA from the vectors.
+      const bool load_graph = graph_bytes > 0 && ob_cuvs_has_graph_io();
       ObCuvsSnapshotFile graph;
       std::vector<char> chunk(OB_CUVS_STAGE_CHUNK);
       uint64_t remaining = graph_bytes;
-      while (graph.file_ != nullptr && remaining > 0) {
+      while ((graph.file_ != nullptr || !load_graph) && remaining > 0) {
         const size_t bytes = std::min<uint64_t>(remaining, chunk.size());
-        if (!ob_cuvs_read(in, chunk.data(), bytes) || ::fwrite(chunk.data(), 1, bytes, graph.file_) != bytes) {
+        if (!ob_cuvs_read(in, chunk.data(), bytes) ||
+            (load_graph && ::fwrite(chunk.data(), 1, bytes, graph.file_) != bytes)) {
           break;
         }
         remaining -= bytes;
       }
       ObCuvsSnapshotJob job{graph.path_, nullptr, static_cast<long>(n), dim32, true, -1};
-      if (graph.file_ == nullptr || remaining != 0 || ::fflush(graph.file_) != 0 ||
-          !ob_cuvs_snapshot_big_stack(job)) {
+      bool loaded = false;
+      if (remaining == 0 && load_graph) {
+        loaded = graph.file_ != nullptr && ::fflush(graph.file_) == 0 && ob_cuvs_snapshot_big_stack(job);
+      } else if (remaining == 0) {
+        std::shared_ptr<void> rebuilt = ob_cuvs_build_big_stack(ent->buf_vecs_.data(),
+                                                                static_cast<long>(n), dim32);
+        loaded = rebuilt != nullptr;
+        if (loaded) { ent->bridge_ = rebuilt; }
+      }
+      if (!loaded) {
         delete ent;
         ret = OB_ERR_VSAG_RETURN_ERROR;
-        LOG_WARN("[OBVSAG][cuVS] failed to load CAGRA graph from snapshot", K(ret), KP(key), K(n64));
+        LOG_WARN("[OBVSAG][cuVS] failed to load CAGRA graph from snapshot", K(ret), KP(key), K(n64),
+                 K(load_graph));
         return ret;
       }
-      ent->bridge_ = ob_cuvs_wrap(job.handle_);
+      if (load_graph) { ent->bridge_ = ob_cuvs_wrap(job.handle_); }
       ent->built_n_ = n;
       ent->ids_ = ent->buf_ids_;
       {
@@ -692,7 +736,7 @@ static int ob_cuvs_deserialize(void *key, int expected_dim, std::istream &in,
         g_ob_cuvs_marked.insert(key);
       }
       LOG_INFO("[OBVSAG][cuVS] deserialized GPU CAGRA snapshot", KP(key), K(n64), K(dim32),
-               K(graph_bytes), K(graph_bytes_trails));
+               K(graph_bytes), K(graph_bytes_trails), K(load_graph));
     }
   }
   return ret;
@@ -2250,7 +2294,7 @@ int cuvs_cagra_knn(const float *base, long n, long dim,
                    const float *query, long nq, long topk, unsigned int *out_ids)
 {
   // Route to the hipVS/cuVS GPU backend (bridge .so). Returns 0 on success.
-  return ::seekdb_cuvs_cagra_knn(base, n, dim, query, nq, topk, out_ids);
+  return ob_cuvs_has_cagra_knn() ? ::seekdb_cuvs_cagra_knn(base, n, dim, query, nq, topk, out_ids) : -1;
 }
 
 // [hipVS/cuVS BATCH operator] Feed nq probe vectors (row-major, dim from the
