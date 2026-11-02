@@ -1,63 +1,110 @@
-# Contest submission notes
+# Contest submission: V7 query checkpoint
 
 Author：FDE WorkMate
 
-- Base: `zihaomu/seekdb` branch `amd-oceanbase-official-contest-base-v5`, commit
-  `634888d9b037153fa143d2c913ba4b25503e1d62` (official AMD contest baseline V5).
-- Scope: only the hipVS bridge (`tools/hipvs_bridge/`) changes. The observer, the SQL
-  behaviour, the `lib=vsag` path, the persisted snapshot format and the CAGRA search
-  parameters (itopk = max(4 x topk, 512), search_width = 4) are those of V5.
-- Build: follow [README.md](README.md) (`tools/hipvs_bridge/build.sh`, then
-  `./build.sh release -DOB_BUILD_CUVS=ON -DCUVS_BRIDGE_LIB=...`). The bridge script still
-  needs only `HIPVS_ROOT` and `ROCM_ROOT`; it now also compiles
-  `seekdb_cuvs_graph.hip` (HIP kernels, gfx1100, symbols kept internal). The library
-  exports the same six `seekdb_cuvs_*` functions as V5.
+## Base and scope
 
-## Index build
+- Repository: `alsxie/seekDB`; submission branch: `amd-hipvs-v7-query`.
+- Parent: the previously scored `amd-hipvs-v6` commit `d4842d89`.
+- Frozen ancestor: `634888d9b037153fa143d2c913ba4b25503e1d62`.
+- Production code changes only `tools/hipvs_bridge/seekdb_cuvs_bridge.c`.
+  Observer, SQL, snapshot format, graph construction and CPU VSAG path are unchanged.
+- Same six exported C entry points. No additional dependency or network access.
 
-`seekdb_cuvs_build` keeps the V5 CAGRA degrees (intermediate 256, final 128) but no
-longer runs NN-descent. The graph is built on the GPU in three steps:
+## Query implementation
 
-1. Exact kNN graph (256 neighbours per row): the dataset is multiplied with itself in
-   tiles of rows (hipBLAS SGEMM, key = |x|^2 - 2 q.x) and a selection kernel keeps the
-   256 smallest keys of every row, the row itself excluded. A threshold taken from a
-   sorted sample of the row collects about 1.5K candidates in shared memory; rows where
-   the threshold misses use an exact radix select. Ties are broken by row id.
-2. Pruning and reverse-edge merge in HIP kernels that follow hipVS
-   `cagra::detail::graph::optimize()`: detour counting, rank-based selection of 128
-   edges, reverse graph, reverse edges inserted after the first 64 forward edges.
-3. Graph and dataset are wrapped with `cuvsCagraIndexFromArgs`, so search,
-   serialization and deserialization are the stock hipVS CAGRA code.
+Each index lazily starts one joinable worker with a 32 MB pthread stack. Every eligible
+single-row search submits a synchronous request; the caller waits until device work and
+result copies finish. Caller pointers remain valid until completion. The existing index
+mutex serializes clients, while a separate mutex/condition variable transfers request
+ownership. No query result or query-dependent search state is cached.
 
-Device memory stays at the V5 level: kNN rows are copied to host memory as they are
-produced, the dataset is released while pruning and uploaded again for the index, and
-the distance tile is sized so that the kNN step needs no more memory than the later
-steps.
+HIP calls run on the long-lived worker instead of a fresh caller thread, avoiding repeated
+HIP thread initialization. Device/pinned input and output buffers are reused, and partial
+allocation failures release those buffers before the original per-call fallback. Index
+release stops and joins the worker before destroying the GPU index and resources.
+Concurrent handle destruction and search is not supported, as with the original ABI.
 
-hipBLAS is resolved at run time (libcuvs already depends on `libhipblas.so.3`). If any
-step fails, the bridge logs it and builds with `cuvsCagraBuild` (NN-descent) exactly like
-V5; `SEEKDB_CUVS_GPU_GRAPH=0` forces that path.
+Single-row CAGRA search uses the organizer's unmodified hipVS `MULTI_CTA` implementation,
+`itopk_size = max(default, 4 * topk, 1024)`, `search_width = 4`, and `HASH` mode. There is no
+iteration cap. These settings apply to every eligible single query, not a test phase or
+dataset. Multi-row search retains the original path. Invalid zero/negative shapes, null
+query/output pointers and topk greater than index size return an error.
 
-Single-row queries reuse the search parameters and the device and pinned buffers held in
-the index handle (one stream synchronisation per query). Results are identical.
+## Build and reproduce
 
-## Measurements
+Use the fixed contest build procedure:
 
-Radeon PRO W7900D dev instance, 250K rows, offline `CREATE VECTOR INDEX ... lib=cuvs`
-(timed DDL), then 4096 SQL queries each for Top-10 and Top-100. VRAM is the peak of the
-whole GPU, sampled during the whole run (load, build, queries).
+```bash
+HIPVS_ROOT=/opt/hipvs ROCM_ROOT=/opt/rocm \
+  tools/hipvs_bridge/build.sh "$OUT/libseekdb_cuvs_bridge.so"
+cmake -S . -B build_release -G "Unix Makefiles" \
+  -DCMAKE_BUILD_TYPE=RelWithDebInfo -DOB_ENABLE_UNITY=ON -DOB_USE_LLD=ON \
+  -DOB_BUILD_CUVS=ON -DOB_BUILD_CUVS_TRACE=OFF \
+  -DCUVS_BRIDGE_LIB="$OUT/libseekdb_cuvs_bridge.so"
+cmake --build build_release --target seekdb
+```
 
-| data | version | build | VRAM peak | Recall@10 | Recall@100 | QPS@10 | QPS@100 |
-|---|---|---|---|---|---|---|---|
-| SIFT 128d | V5 | 47.6 s | 700 MB | 1.0000 | 1.0000 | 141.6 | 136.8 |
-| SIFT 128d | this | 6.0 s | 705 MB | 1.0000 | 1.0000 | 146.3 | 141.3 |
-| NYT 256d | V5 | 47.1 s | 822 MB | 0.4085 | 0.5305 | 126.4 | 125.1 |
-| NYT 256d | this | 8.7 s | 827 MB | 0.4093 | 0.5299 | 139.2 | 138.6 |
+The bridge script compiled successfully with the supplied ROCm 7.2.4/hipVS image.
+No observer source changed; development tests use the frozen V5 observer with the rebuilt
+bridge. A complete observer source rebuild was not repeated for this checkpoint.
+Official evaluation still builds observer from source.
 
-NYT is angular data indexed with L2, so both versions have low absolute recall there; it
-is used for the 256d comparison only.
+Additional real-GPU regression test:
 
-The kNN graph matches the hipVS brute-force kNN (SIFT: 99.9985 % of the neighbour sets,
-same nearest neighbour in every row, no self edges or duplicates). The official
-`validation/run_gpu_smoke.sh` and `validation/run_ddl_persistence_smoke.sh` pass with
-this bridge.
+```bash
+hipcc -O2 -std=c++17 -Itools/hipvs_bridge \
+  tools/hipvs_bridge/test_search_worker.cpp \
+  -L"$OUT" -lseekdb_cuvs_bridge -lpthread -o test_search_worker
+LD_LIBRARY_PATH="$OUT:/opt/hipvs/lib:/opt/rocm/lib" \
+  ./test_search_worker <serialized-cagra-index> 250000 128
+```
+
+It checks invalid arguments, snapshot shape mismatch, four load/search/free cycles,
+four concurrent clients, topk 1/10/100/129/256, result ranges/distinctness, finite L2
+distances, null distance output, buffer growth and batch calls after single queries.
+Both 128d and 256d tests passed.
+
+## Development measurements, 2026-11-02
+
+Real gfx1100 GPU, ROCm 7.2.4, seekdb configured with 24 CPUs. Each dataset has 250K rows;
+4096 sequential single-row SQL queries are run separately for Top-10 and Top-100.
+Build is offline `CREATE VECTOR INDEX ... lib=cuvs` plus the first approximate query.
+This is one paired development run, not an official score or a confidence interval.
+
+| Dataset | Version | Build (s) | QPS@10 | QPS@100 | Recall@10 | Recall@100 |
+|---|---|---:|---:|---:|---:|---:|
+| SIFT 128d | Frozen V5 | 46.707 | 141.8 | 138.7 | 1.0000 | 1.0000 |
+| SIFT 128d | V6 scored checkpoint | 6.101 | 148.4 | 142.8 | 0.9999 | 1.0000 |
+| SIFT 128d | V7 query checkpoint | 5.984 | 1010.1 | 843.5 | 1.0000 | 1.0000 |
+| NYT 256d proxy | Frozen V5 | 47.647 | 130.3 | 128.4 | 0.4089 | 0.5308 |
+| NYT 256d proxy | V6 scored checkpoint | 9.100 | 138.8 | 135.9 | 0.4093 | 0.5299 |
+| NYT 256d proxy | V7 query checkpoint | 8.714 | 1071.1 | 975.7 | 0.4097 | 0.5303 |
+
+All SQL queries returned exactly k distinct IDs. NYT is angular data indexed with L2;
+its absolute recall is low for both versions. It is only a regression proxy and does
+not establish compliance with the hidden dataset's absolute recall thresholds.
+
+A separate complete build/query VRAM sampling pass (about 0.4 seconds per sample including
+SMI overhead) recorded V5/candidate peaks of 698/701 MB on SIFT and 821/823 MB on NYT;
+ratios are 1.0043 and 1.0024, below 1.25. Sampling is not an allocation-level proof.
+
+Official GPU smoke: all 12 cases PASS, including VSAG, filter/delete fallback, batch
+queries, GPU device access and no-GPU fallback. DDL persistence smoke: PASS with graph
+reload after restart, `cuvs_serve`, no rebuild, CPU reload and no stale IDs. An initial
+repeat failed at startup because previous smoke block files filled the workspace;
+after approved cleanup, the clean repeat passed all cases.
+
+API serialize/deserialize tests also passed on both datasets. No persisted format or
+serialized/deserialized log text changed.
+
+## Scoring limits and next work
+
+V6 previously earned 15 points officially. Its development build ratios were already
+higher than the full-score line, so these local ratios do not explain that score.
+V7 attacks query overhead; its graph builder is unchanged. Hidden recall and official
+build/query ratios remain to be measured by the grader. Do not interpret these proxy
+measurements as a guarantee of 20 points.
+
+Keep the old branch and commit as the rollback reference. Further build experiments
+should use another branch after obtaining the official build/query/gates breakdown.

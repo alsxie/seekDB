@@ -1,3 +1,4 @@
+/* Author：FDE WorkMate */
 /* seekdb <-> hipVS bridge: plain-C CAGRA kNN; all cuVS/ROCm deps live here.
  * Index build: exact GPU kNN (hipBLAS GEMM tiles + top-K selection) + CAGRA prune/merge
  * (seekdb_cuvs_graph.hip), wrapped with cuvsCagraIndexFromArgs; cuvsCagraBuild
@@ -37,12 +38,36 @@ typedef struct {
   float* d_q; unsigned* d_ids; float* d_dist;
   float* h_q; unsigned* h_ids; float* h_dist;
   long cap_k;
+  /* Synchronous requests run HIP on one long-lived thread per index. mu serializes
+   * clients; worker_mu/cv transfer request ownership. No query/result is cached. */
+  pthread_t worker;
+  pthread_mutex_t worker_mu;
+  pthread_cond_t worker_cv;
+  int worker_started, worker_stop, worker_pending, worker_rc;
+  const float* worker_query;
+  long worker_topk;
+  unsigned* worker_ids;
+  float* worker_dist;
 } sk_cuvs_index;
+
+static void sk_destroy_sync(sk_cuvs_index* h)
+{
+  pthread_cond_destroy(&h->worker_cv);
+  pthread_mutex_destroy(&h->worker_mu);
+  pthread_mutex_destroy(&h->mu);
+}
 
 static sk_cuvs_index* sk_new_index(void)
 {
   sk_cuvs_index* h = (sk_cuvs_index*)calloc(1, sizeof(sk_cuvs_index));
-  if (h && pthread_mutex_init(&h->mu, NULL) != 0) { free(h); h = NULL; }
+  if (!h) return NULL;
+  if (pthread_mutex_init(&h->mu, NULL) != 0) { free(h); return NULL; }
+  if (pthread_mutex_init(&h->worker_mu, NULL) != 0) {
+    pthread_mutex_destroy(&h->mu); free(h); return NULL;
+  }
+  if (pthread_cond_init(&h->worker_cv, NULL) != 0) {
+    pthread_mutex_destroy(&h->worker_mu); pthread_mutex_destroy(&h->mu); free(h); return NULL;
+  }
   return h;
 }
 
@@ -78,7 +103,7 @@ void* seekdb_cuvs_build(const float* base, long n, long dim)
 {
   sk_cuvs_index* h = sk_new_index();
   if (!h) return NULL;
-  if (cuvsResourcesCreate(&h->res) != CUVS_SUCCESS) { pthread_mutex_destroy(&h->mu); free(h); return NULL; }
+  if (cuvsResourcesCreate(&h->res) != CUVS_SUCCESS) { sk_destroy_sync(h); free(h); return NULL; }
 
   DLManagedTensor dset; long ds[2] = {n, dim};
   dset.dl_tensor.data = (void*)base;
@@ -121,18 +146,24 @@ void* seekdb_cuvs_build(const float* base, long n, long dim)
 
 fail_idx: cuvsCagraIndexDestroy(h->idx);
 fail_ip:  cuvsCagraIndexParamsDestroy(h->ip);
-fail_res: cuvsResourcesDestroy(h->res); pthread_mutex_destroy(&h->mu); free(h);
+fail_res: cuvsResourcesDestroy(h->res); sk_destroy_sync(h); free(h);
   fprintf(stderr, "[seekdb_cuvs] build failed: %s\n", cuvsGetLastErrorText());
   return NULL;
 }
 
-/* itopk/search_width exactly as the per-call parameters below */
+/* Single-row CAGRA parameters: preserve a wide search frontier and use the
+ * fixed hipVS multi-CTA implementation to parallelize one query. */
 static void sk_set_search_params(cuvsCagraSearchParams_t sp, size_t default_itopk, long topk)
 {
   size_t required_itopk = (size_t)topk * 4;
   if (required_itopk < 512) required_itopk = 512;
   sp->itopk_size = default_itopk < required_itopk ? required_itopk : default_itopk;
   sp->search_width = 4;
+  /* More parallel search frontiers preserve recall without a sequential CTA's latency.
+   * This applies to every eligible single query, independent of benchmark phase. */
+  if (sp->itopk_size < 1024) sp->itopk_size = 1024;
+  sp->algo = MULTI_CTA;
+  sp->hashmap_mode = HASH;
 }
 
 /* One query with buffers kept in the handle: no device allocation and a single stream
@@ -147,9 +178,11 @@ static int sk_search_one(sk_cuvs_index* h, const float* query, long topk,
     if (cuvsCagraSearchParamsCreate(&h->sp) != CUVS_SUCCESS) { h->sp = 0; return -1; }
     h->sp_default_itopk = h->sp->itopk_size;
   }
-  if (!h->d_q) {
-    if (hipMalloc((void**)&h->d_q, sizeof(float) * h->dim) != hipSuccess) { h->d_q = 0; return -1; }
-    if (hipHostMalloc((void**)&h->h_q, sizeof(float) * h->dim, 0) != hipSuccess) { h->h_q = 0; return -1; }
+  if (!h->d_q && hipMalloc((void**)&h->d_q, sizeof(float) * h->dim) != hipSuccess) {
+    h->d_q = 0; return -1;
+  }
+  if (!h->h_q && hipHostMalloc((void**)&h->h_q, sizeof(float) * h->dim, 0) != hipSuccess) {
+    h->h_q = 0; return -1;
   }
   if (topk > h->cap_k) {
     const long cap = topk < 128 ? 128 : topk;
@@ -190,16 +223,76 @@ static int sk_search_one(sk_cuvs_index* h, const float* query, long topk,
   return 0;
 }
 
+static void* sk_search_worker(void* arg)
+{
+  sk_cuvs_index* h = (sk_cuvs_index*)arg;
+  pthread_mutex_lock(&h->worker_mu);
+  for (;;) {
+    while (!h->worker_pending && !h->worker_stop)
+      pthread_cond_wait(&h->worker_cv, &h->worker_mu);
+    if (h->worker_stop) break;
+    pthread_mutex_unlock(&h->worker_mu);
+    const int rc = sk_search_one(h, h->worker_query, h->worker_topk,
+                                 h->worker_ids, h->worker_dist);
+    /* Allocation failure may have left partial buffers: release them on the owning
+     * thread before the caller tries the unchanged per-call fallback. */
+    if (rc < 0) sk_release_search_state(h);
+    if (rc > 0) fprintf(stderr, "[seekdb_cuvs] worker search rc=%d: %s\n", rc, cuvsGetLastErrorText());
+    pthread_mutex_lock(&h->worker_mu);
+    h->worker_rc = rc;
+    h->worker_pending = 0;
+    pthread_cond_broadcast(&h->worker_cv);
+  }
+  pthread_mutex_unlock(&h->worker_mu);
+  sk_release_search_state(h);
+  return NULL;
+}
+
+/* The caller holds h->mu until the request completes; pointers stay valid. */
+static int sk_worker_search_one(sk_cuvs_index* h, const float* query, long topk,
+                                 unsigned* out_ids, float* out_dist)
+{
+  if (!h->worker_started) {
+    pthread_attr_t attr;
+    if (pthread_attr_init(&attr) != 0) return sk_search_one(h, query, topk, out_ids, out_dist);
+    int rc = pthread_attr_setstacksize(&attr, 32UL * 1024 * 1024);
+    if (!rc) rc = pthread_create(&h->worker, &attr, sk_search_worker, h);
+    pthread_attr_destroy(&attr);
+    if (rc) return sk_search_one(h, query, topk, out_ids, out_dist);
+    h->worker_started = 1;
+  }
+  pthread_mutex_lock(&h->worker_mu);
+  h->worker_query = query; h->worker_topk = topk;
+  h->worker_ids = out_ids; h->worker_dist = out_dist;
+  h->worker_pending = 1;
+  pthread_cond_broadcast(&h->worker_cv);
+  while (h->worker_pending) pthread_cond_wait(&h->worker_cv, &h->worker_mu);
+  const int rc = h->worker_rc;
+  pthread_mutex_unlock(&h->worker_mu);
+  return rc;
+}
+
+static void sk_stop_worker(sk_cuvs_index* h)
+{
+  if (!h->worker_started) return;
+  pthread_mutex_lock(&h->worker_mu);
+  h->worker_stop = 1;
+  pthread_cond_broadcast(&h->worker_cv);
+  pthread_mutex_unlock(&h->worker_mu);
+  pthread_join(h->worker, NULL);
+  h->worker_started = 0;
+}
+
 int seekdb_cuvs_search(void* handle, const float* query, long nq, long topk,
                        unsigned int* out_ids, float* out_dist)
 {
   sk_cuvs_index* h = (sk_cuvs_index*)handle;
-  if (!h) return 1;
+  if (!h || !query || !out_ids || nq <= 0 || topk <= 0 || topk > h->n) return 1;
   int rc = 0;
   float* qd = 0; unsigned* nd = 0; float* dd = 0; cuvsCagraSearchParams_t sp = 0;
   pthread_mutex_lock(&h->mu);
   if (nq == 1 && topk > 0 && query && out_ids) {
-    rc = sk_search_one(h, query, topk, out_ids, out_dist);
+    rc = sk_worker_search_one(h, query, topk, out_ids, out_dist);
     if (rc >= 0) goto done;
     sk_release_search_state(h);
     rc = 0;
@@ -241,6 +334,7 @@ void seekdb_cuvs_free(void* handle)
 {
   sk_cuvs_index* h = (sk_cuvs_index*)handle;
   if (!h) return;
+  sk_stop_worker(h);
   sk_release_search_state(h);
   cuvsCagraIndexDestroy(h->idx);
   /* the index only viewed these buffers; release them after the index */
@@ -248,7 +342,7 @@ void seekdb_cuvs_free(void* handle)
   seekdb_cuvs_graph_release(h->d_dataset);
   cuvsCagraIndexParamsDestroy(h->ip);
   cuvsResourcesDestroy(h->res);
-  pthread_mutex_destroy(&h->mu);
+  sk_destroy_sync(h);
   free(h);
 }
 
@@ -294,7 +388,7 @@ fail_res:
   cuvsResourcesDestroy(index->res);
 fail:
   fprintf(stderr, "[seekdb_cuvs] deserialize failed: %s\n", cuvsGetLastErrorText());
-  pthread_mutex_destroy(&index->mu);
+  sk_destroy_sync(index);
   free(index);
   return NULL;
 }
